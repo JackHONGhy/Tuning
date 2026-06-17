@@ -1,82 +1,144 @@
 #!/usr/bin/env bash
-# BBR + CAKE automation for transit + exit + shared-node servers.
-# Requirements: Linux kernel >= 5.4, sch_cake/ifb modules available.
+# BBR + CAKE tuning for transit + exit + shared-node servers.
+# Commands: apply, install, status, cleanup, uninstall
+# Requirements: Linux kernel >= 5.4, iproute2 tc, sch_cake/ifb support.
 set -euo pipefail
 
-######################## User settings ########################
-# For shared nodes, enable shaping and set bandwidth to 90%-95% of stable measured speed.
-ENABLE_LIMITS=1
-BANDWIDTH_UP_DEFAULT="285Mbit"       # Example: measured upload 300M, use 285Mbit.
-BANDWIDTH_DOWN_DEFAULT="950Mbit"     # Example: measured download 1000M, use 950Mbit.
+INSTALL_PATH="/usr/local/sbin/bbr-cake-transit-exit"
+SERVICE_NAME="bbr-cake-transit-exit.service"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
+ENV_FILE="/etc/default/bbr-cake-transit-exit"
+SYSCTL_FILE="/etc/sysctl.d/99-bbr-cake-transit-exit.conf"
+SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/JackHONGhy/Tuning/refs/heads/main/Tuning}"
 
-# 50ms works well for many HK/JP/SG/US-west style transit/exit routes.
-# For long cross-region routes, try 100ms.
-CAKE_RTT="50ms"
+OVERRIDE_ENABLE_LIMITS="${ENABLE_LIMITS:-}"
+OVERRIDE_UP_RATE="${UP_RATE:-}"
+OVERRIDE_DOWN_RATE="${DOWN_RATE:-}"
+OVERRIDE_BANDWIDTH_UP_DEFAULT="${BANDWIDTH_UP_DEFAULT:-}"
+OVERRIDE_BANDWIDTH_DOWN_DEFAULT="${BANDWIDTH_DOWN_DEFAULT:-}"
+OVERRIDE_CAKE_RTT="${CAKE_RTT:-}"
+OVERRIDE_BASE_CAKE_OPTS="${BASE_CAKE_OPTS:-}"
+OVERRIDE_ENABLE_FORWARDING="${ENABLE_FORWARDING:-}"
+OVERRIDE_INCLUDE_VPN_PREFIX_INTERFACES="${INCLUDE_VPN_PREFIX_INTERFACES:-}"
+OVERRIDE_VPN_NAME_PREFIXES="${VPN_NAME_PREFIXES:-}"
+OVERRIDE_EXTRA_WAN_INTERFACES="${EXTRA_WAN_INTERFACES:-}"
+OVERRIDE_AUTO_ENABLE_CAKE_NAT="${AUTO_ENABLE_CAKE_NAT:-}"
+OVERRIDE_ENABLE_INGRESS_SHAPING="${ENABLE_INGRESS_SHAPING:-}"
+OVERRIDE_MSS_CLAMP_V4="${MSS_CLAMP_V4:-}"
+OVERRIDE_MSS_CLAMP_V6="${MSS_CLAMP_V6:-}"
+OVERRIDE_MSS_CLAMP_HOST_OUTPUT="${MSS_CLAMP_HOST_OUTPUT:-}"
+OVERRIDE_DISABLE_GRO_GSO_ON_VPN="${DISABLE_GRO_GSO_ON_VPN:-}"
+OVERRIDE_UP_OVERRIDES="${UP_OVERRIDES:-}"
+OVERRIDE_DOWN_OVERRIDES="${DOWN_OVERRIDES:-}"
 
-# CAKE options for shared transit/exit nodes. "nat" is added automatically when NAT is detected.
-BASE_CAKE_OPTS="diffserv3 triple-isolate ack-filter split-gso"
-
-# Transit/exit nodes usually need forwarding enabled.
-ENABLE_FORWARDING=1
-
-# Default: shape only real default-route WAN interfaces.
-# Enable this only if you explicitly want wg/tun/ppp interfaces shaped too.
-INCLUDE_VPN_PREFIX_INTERFACES=0
-VPN_NAME_PREFIXES="wg tun ppp"
-
-# Manually add extra WAN interfaces if needed.
-# Example: declare -a EXTRA_WAN_INTERFACES=("eth1" "ens5")
-declare -a EXTRA_WAN_INTERFACES=()
-
-# Auto-add CAKE "nat" when MASQUERADE/SNAT is detected.
-AUTO_ENABLE_CAKE_NAT=1
-
-# Ingress IFB improves loaded-latency and fairness, but costs CPU.
-# If CPU is saturated or throughput drops too much, set this to 0.
-ENABLE_INGRESS_SHAPING=1
-
-# Global MSS clamping. FORWARD helps transit/NAT; OUTPUT helps local proxy egress.
-MSS_CLAMP_V4=1
-MSS_CLAMP_V6=1
-MSS_CLAMP_HOST_OUTPUT=1
-
-# Keep off by default to preserve throughput.
-DISABLE_GRO_GSO_ON_VPN=0
-
-# Per-interface bandwidth overrides. Interface names must match "ip link".
-# Example:
-# declare -A BANDWIDTH_UP_OVERRIDES=( ["eth0"]="285Mbit" ["ens5"]="900Mbit" )
-# declare -A BANDWIDTH_DOWN_OVERRIDES=( ["eth0"]="950Mbit" ["ens5"]="1800Mbit" )
-declare -A BANDWIDTH_UP_OVERRIDES=()
-declare -A BANDWIDTH_DOWN_OVERRIDES=()
-################################################################
-
-if [[ ${EUID} -ne 0 ]]; then
-  echo "[ERROR] Please run as root." >&2
-  exit 1
+if [[ -f "${ENV_FILE}" ]]; then
+  . "${ENV_FILE}"
 fi
 
-need_bin(){
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "[ERROR] Missing command: $1" >&2
-    exit 1
-  }
+ENABLE_LIMITS="${OVERRIDE_ENABLE_LIMITS:-${ENABLE_LIMITS:-1}}"
+BANDWIDTH_UP_DEFAULT="${OVERRIDE_UP_RATE:-${OVERRIDE_BANDWIDTH_UP_DEFAULT:-${UP_RATE:-${BANDWIDTH_UP_DEFAULT:-285Mbit}}}}"
+BANDWIDTH_DOWN_DEFAULT="${OVERRIDE_DOWN_RATE:-${OVERRIDE_BANDWIDTH_DOWN_DEFAULT:-${DOWN_RATE:-${BANDWIDTH_DOWN_DEFAULT:-950Mbit}}}}"
+CAKE_RTT="${OVERRIDE_CAKE_RTT:-${CAKE_RTT:-50ms}}"
+BASE_CAKE_OPTS="${OVERRIDE_BASE_CAKE_OPTS:-${BASE_CAKE_OPTS:-diffserv3 triple-isolate ack-filter split-gso}}"
+ENABLE_FORWARDING="${OVERRIDE_ENABLE_FORWARDING:-${ENABLE_FORWARDING:-1}}"
+INCLUDE_VPN_PREFIX_INTERFACES="${OVERRIDE_INCLUDE_VPN_PREFIX_INTERFACES:-${INCLUDE_VPN_PREFIX_INTERFACES:-0}}"
+VPN_NAME_PREFIXES="${OVERRIDE_VPN_NAME_PREFIXES:-${VPN_NAME_PREFIXES:-wg tun ppp}}"
+EXTRA_WAN_INTERFACES="${OVERRIDE_EXTRA_WAN_INTERFACES:-${EXTRA_WAN_INTERFACES:-}}"
+AUTO_ENABLE_CAKE_NAT="${OVERRIDE_AUTO_ENABLE_CAKE_NAT:-${AUTO_ENABLE_CAKE_NAT:-1}}"
+ENABLE_INGRESS_SHAPING="${OVERRIDE_ENABLE_INGRESS_SHAPING:-${ENABLE_INGRESS_SHAPING:-1}}"
+MSS_CLAMP_V4="${OVERRIDE_MSS_CLAMP_V4:-${MSS_CLAMP_V4:-1}}"
+MSS_CLAMP_V6="${OVERRIDE_MSS_CLAMP_V6:-${MSS_CLAMP_V6:-1}}"
+MSS_CLAMP_HOST_OUTPUT="${OVERRIDE_MSS_CLAMP_HOST_OUTPUT:-${MSS_CLAMP_HOST_OUTPUT:-1}}"
+DISABLE_GRO_GSO_ON_VPN="${OVERRIDE_DISABLE_GRO_GSO_ON_VPN:-${DISABLE_GRO_GSO_ON_VPN:-0}}"
+UP_OVERRIDES="${OVERRIDE_UP_OVERRIDES:-${UP_OVERRIDES:-}}"
+DOWN_OVERRIDES="${OVERRIDE_DOWN_OVERRIDES:-${DOWN_OVERRIDES:-}}"
+
+declare -A BANDWIDTH_UP_OVERRIDES=()
+declare -A BANDWIDTH_DOWN_OVERRIDES=()
+declare -A CANDIDATES=()
+
+log(){ printf '[*] %s\n' "$*"; }
+ok(){ printf '[OK] %s\n' "$*"; }
+warn(){ printf '[WARN] %s\n' "$*" >&2; }
+die(){ printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+
+require_root(){
+  [[ ${EUID} -eq 0 ]] || die "Please run as root."
 }
 
-need_bin ip
-need_bin tc
-need_bin sysctl
-need_bin awk
-need_bin grep
+need_bin(){
+  command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
+}
 
-echo "[*] Writing /etc/sysctl.d/99-bbr-cake-transit-exit.conf"
+usage(){
+  cat <<EOF
+Usage:
+  $0 apply       Apply BBR + CAKE tuning now. This is the default command.
+  $0 install     Install script, write config, create and enable systemd service.
+  $0 status      Show sysctl, service, qdisc and MSS status.
+  $0 cleanup     Remove runtime qdisc/IFB/MSS rules created by this script.
+  $0 uninstall   Disable service, cleanup runtime state and remove installed files.
 
-cat >/etc/sysctl.d/99-bbr-cake-transit-exit.conf <<EOF
+Environment overrides:
+  UP_RATE=285Mbit DOWN_RATE=950Mbit $0 apply
+  CAKE_RTT=100ms ENABLE_INGRESS_SHAPING=0 $0 apply
+  EXTRA_WAN_INTERFACES="ens18 ens19" $0 apply
+  UP_OVERRIDES="ens18=285Mbit ens19=900Mbit" $0 apply
+  DOWN_OVERRIDES="ens18=950Mbit ens19=1800Mbit" $0 apply
+EOF
+}
+
+parse_overrides(){
+  local input="$1"
+  local map_name="$2"
+  local pair key value
+  local -n target_map="${map_name}"
+
+  input="${input//,/ }"
+  for pair in ${input}; do
+    [[ "${pair}" == *=* ]] || continue
+    key="${pair%%=*}"
+    value="${pair#*=}"
+    [[ -n "${key}" && -n "${value}" ]] || continue
+    target_map["${key}"]="${value}"
+  done
+}
+
+load_overrides(){
+  parse_overrides "${UP_OVERRIDES}" BANDWIDTH_UP_OVERRIDES
+  parse_overrides "${DOWN_OVERRIDES}" BANDWIDTH_DOWN_OVERRIDES
+}
+
+preflight(){
+  need_bin ip
+  need_bin tc
+  need_bin sysctl
+  need_bin awk
+  need_bin grep
+  need_bin sed
+
+  if command -v modprobe >/dev/null 2>&1; then
+    modprobe tcp_bbr 2>/dev/null || true
+    for module in sch_cake ifb cls_matchall act_mirred; do
+      modprobe "${module}" 2>/dev/null || true
+    done
+  fi
+
+  local available_cc
+  available_cc="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+  if ! printf '%s\n' "${available_cc}" | grep -qw bbr; then
+    die "BBR is not available in this kernel. Available congestion controls: ${available_cc:-unknown}"
+  fi
+}
+
+write_sysctl(){
+  log "Writing ${SYSCTL_FILE}"
+
+  cat >"${SYSCTL_FILE}" <<EOF
 fs.file-max = 2097152
 net.ipv4.tcp_congestion_control = bbr
 net.core.default_qdisc = cake
 
-# TCP basics
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_moderate_rcvbuf = 1
@@ -86,7 +148,6 @@ net.ipv4.tcp_rfc1337 = 1
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing = 1
 
-# Conservative buffers
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.ipv4.tcp_rmem = 4096 87380 16777216
@@ -94,16 +155,13 @@ net.ipv4.tcp_wmem = 4096 65536 16777216
 net.ipv4.udp_rmem_min = 8192
 net.ipv4.udp_wmem_min = 8192
 
-# Queues and connection backlog
 net.core.somaxconn = 8192
 net.ipv4.tcp_max_syn_backlog = 8192
 
-# Transit/exit forwarding
 net.ipv4.ip_forward = ${ENABLE_FORWARDING}
 net.ipv4.conf.all.forwarding = ${ENABLE_FORWARDING}
 net.ipv6.conf.all.forwarding = ${ENABLE_FORWARDING}
 
-# VPN/transit compatibility
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
@@ -112,88 +170,83 @@ net.ipv4.conf.all.rp_filter = 0
 net.ipv4.conf.default.rp_filter = 0
 EOF
 
-sysctl --system >/dev/null
+  sysctl -p "${SYSCTL_FILE}" >/dev/null
+}
 
-for module in sch_cake ifb cls_matchall act_mirred; do
-  if command -v modprobe >/dev/null 2>&1; then
-    modprobe "$module" 2>/dev/null || true
-  fi
-done
+detect_cake_nat(){
+  CAKE_NAT_OPT=""
+  [[ "${AUTO_ENABLE_CAKE_NAT}" -eq 1 ]] || return 0
 
-CAKE_NAT_OPT=""
-if [[ "${AUTO_ENABLE_CAKE_NAT}" -eq 1 ]]; then
-  HAS_NAT=0
+  local has_nat=0
 
   if command -v iptables >/dev/null 2>&1; then
     if iptables -t nat -S POSTROUTING 2>/dev/null | grep -Eiq 'MASQUERADE|SNAT'; then
-      HAS_NAT=1
+      has_nat=1
     fi
   fi
 
   if command -v nft >/dev/null 2>&1; then
     if nft list ruleset 2>/dev/null | grep -Eiq 'masquerade|snat'; then
-      HAS_NAT=1
+      has_nat=1
     fi
   fi
 
-  if [[ "${HAS_NAT}" -eq 1 ]]; then
+  if [[ "${has_nat}" -eq 1 ]]; then
     CAKE_NAT_OPT="nat"
-    echo "[*] NAT detected, enabling CAKE nat mode"
+    log "NAT detected, enabling CAKE nat mode"
   fi
-fi
-
-declare -A CANDIDATES=()
+}
 
 add_candidate(){
   local dev="${1%%@*}"
-  [[ -z "${dev}" ]] && return 0
+  [[ -n "${dev}" ]] || return 0
   [[ -d "/sys/class/net/${dev}" ]] || return 0
   CANDIDATES["${dev}"]=1
 }
 
-# Default: only real default-route egress interfaces.
-while read -r dev; do
-  add_candidate "${dev}"
-done < <(ip -o -4 route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") print $(i+1)}')
+discover_candidates(){
+  CANDIDATES=()
 
-while read -r dev; do
-  add_candidate "${dev}"
-done < <(ip -o -6 route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") print $(i+1)}')
+  while read -r dev; do
+    add_candidate "${dev}"
+  done < <(ip -o -4 route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") print $(i+1)}')
 
-if [[ "${INCLUDE_VPN_PREFIX_INTERFACES}" -eq 1 ]]; then
-  for p in ${VPN_NAME_PREFIXES}; do
-    while read -r dev; do
-      add_candidate "${dev}"
-    done < <(ip -o link show | awk -F': ' '{print $2}' | awk -F'@' '{print $1}' | grep -E "^${p}[0-9A-Za-z_.-]*$" || true)
-  done
-fi
+  while read -r dev; do
+    add_candidate "${dev}"
+  done < <(ip -o -6 route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") print $(i+1)}')
 
-for dev in "${EXTRA_WAN_INTERFACES[@]}"; do
-  add_candidate "${dev}"
-done
-
-for dev in "${!CANDIDATES[@]}"; do
-  if [[ "${dev}" =~ ^(lo|ifb|veth|docker|virbr|br-|br|kube|tap|macvtap) ]]; then
-    unset "CANDIDATES[${dev}]"
+  if [[ "${INCLUDE_VPN_PREFIX_INTERFACES}" -eq 1 ]]; then
+    local p
+    for p in ${VPN_NAME_PREFIXES}; do
+      while read -r dev; do
+        add_candidate "${dev}"
+      done < <(ip -o link show | awk -F': ' '{print $2}' | awk -F'@' '{print $1}' | grep -E "^${p}[0-9A-Za-z_.-]*$" || true)
+    done
   fi
-done
 
-if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
-  echo "[ERROR] No default-route egress interface found. Check ip route or set EXTRA_WAN_INTERFACES." >&2
-  exit 1
-fi
+  local dev
+  for dev in ${EXTRA_WAN_INTERFACES}; do
+    add_candidate "${dev}"
+  done
 
-echo "[*] Egress interfaces: $(printf '%s ' "${!CANDIDATES[@]}" | xargs)"
+  for dev in "${!CANDIDATES[@]}"; do
+    if [[ "${dev}" =~ ^(lo|ifb|veth|docker|virbr|br-|br|kube|tap|macvtap) ]]; then
+      unset "CANDIDATES[${dev}]"
+    fi
+  done
+
+  [[ ${#CANDIDATES[@]} -gt 0 ]] || die "No egress interface found. Check ip route or set EXTRA_WAN_INTERFACES."
+}
 
 cleanup_qdisc(){
-  local d="$1"
-  tc qdisc del dev "$d" root 2>/dev/null || true
-  tc qdisc del dev "$d" ingress 2>/dev/null || true
+  local dev="$1"
+  tc qdisc del dev "${dev}" root 2>/dev/null || true
+  tc qdisc del dev "${dev}" ingress 2>/dev/null || true
 }
 
 ensure_ingress_hook(){
-  local d="$1"
-  tc qdisc replace dev "$d" handle ffff: ingress 2>/dev/null || true
+  local dev="$1"
+  tc qdisc replace dev "${dev}" handle ffff: ingress 2>/dev/null || true
 }
 
 dev_mtu(){
@@ -218,6 +271,7 @@ ifb_name(){
 append_cake_opt(){
   local current="$1"
   local opt="$2"
+
   if [[ " ${current} " == *" ${opt} "* ]]; then
     printf '%s' "${current}"
   else
@@ -225,116 +279,340 @@ append_cake_opt(){
   fi
 }
 
-for DEV in "${!CANDIDATES[@]}"; do
-  echo
-  echo "[*] Configuring egress interface: ${DEV}"
+apply_qdisc(){
+  log "Egress interfaces: $(printf '%s ' "${!CANDIDATES[@]}" | xargs)"
 
-  ip link set dev "${DEV}" up || true
-  cleanup_qdisc "${DEV}"
+  local dev ifb cake_opts up_rate down_rate
+  for dev in "${!CANDIDATES[@]}"; do
+    echo
+    log "Configuring egress interface: ${dev}"
 
-  CAKE_OPTS="${BASE_CAKE_OPTS}"
+    ip link set dev "${dev}" up || true
+    cleanup_qdisc "${dev}"
 
-  if [[ -n "${CAKE_NAT_OPT}" ]]; then
-    CAKE_OPTS="$(append_cake_opt "${CAKE_OPTS}" "${CAKE_NAT_OPT}")"
-  fi
-
-  if is_pppoe "${DEV}"; then
-    CAKE_OPTS="$(append_cake_opt "${CAKE_OPTS}" "pppoe")"
-  fi
-
-  UP_RATE="${BANDWIDTH_UP_OVERRIDES[$DEV]:-${BANDWIDTH_UP_DEFAULT}}"
-  DOWN_RATE="${BANDWIDTH_DOWN_OVERRIDES[$DEV]:-${BANDWIDTH_DOWN_DEFAULT}}"
-
-  if [[ "${ENABLE_LIMITS}" -eq 1 ]]; then
-    echo "  - egress CAKE: ${UP_RATE}, rtt ${CAKE_RTT}, opts [${CAKE_OPTS}]"
-    tc qdisc replace dev "${DEV}" root cake bandwidth "${UP_RATE}" rtt "${CAKE_RTT}" ${CAKE_OPTS}
-  else
-    echo "  - egress CAKE: unlimited, rtt ${CAKE_RTT}, opts [${CAKE_OPTS}]"
-    tc qdisc replace dev "${DEV}" root cake rtt "${CAKE_RTT}" ${CAKE_OPTS}
-  fi
-
-  if [[ "${ENABLE_INGRESS_SHAPING}" -eq 1 ]]; then
-    IFB="$(ifb_name "${DEV}")"
-
-    if ! ip link show "${IFB}" >/dev/null 2>&1; then
-      ip link add "${IFB}" type ifb 2>/dev/null || {
-        echo "  ! Failed to create IFB ${IFB}; skipping ingress shaping for ${DEV}"
-        continue
-      }
+    cake_opts="${BASE_CAKE_OPTS}"
+    if [[ -n "${CAKE_NAT_OPT}" ]]; then
+      cake_opts="$(append_cake_opt "${cake_opts}" "${CAKE_NAT_OPT}")"
+    fi
+    if is_pppoe "${dev}"; then
+      cake_opts="$(append_cake_opt "${cake_opts}" "pppoe")"
     fi
 
-    ip link set dev "${IFB}" up
-    ip link set dev "${IFB}" mtu "$(dev_mtu "${DEV}")" || true
-
-    ensure_ingress_hook "${DEV}"
-    tc filter replace dev "${DEV}" ingress pref 1 protocol all matchall \
-      action mirred egress redirect dev "${IFB}"
-
-    cleanup_qdisc "${IFB}"
+    up_rate="${BANDWIDTH_UP_OVERRIDES[$dev]:-${BANDWIDTH_UP_DEFAULT}}"
+    down_rate="${BANDWIDTH_DOWN_OVERRIDES[$dev]:-${BANDWIDTH_DOWN_DEFAULT}}"
 
     if [[ "${ENABLE_LIMITS}" -eq 1 ]]; then
-      echo "  - ingress CAKE@${IFB}: ${DOWN_RATE}, rtt ${CAKE_RTT}, opts [${CAKE_OPTS}] + ingress"
-      tc qdisc replace dev "${IFB}" root cake bandwidth "${DOWN_RATE}" rtt "${CAKE_RTT}" ${CAKE_OPTS} ingress
+      echo "  - egress CAKE: ${up_rate}, rtt ${CAKE_RTT}, opts [${cake_opts}]"
+      tc qdisc replace dev "${dev}" root cake bandwidth "${up_rate}" rtt "${CAKE_RTT}" ${cake_opts}
     else
-      echo "  - ingress CAKE@${IFB}: unlimited, rtt ${CAKE_RTT}, opts [${CAKE_OPTS}] + ingress"
-      tc qdisc replace dev "${IFB}" root cake rtt "${CAKE_RTT}" ${CAKE_OPTS} ingress
+      echo "  - egress CAKE: unlimited, rtt ${CAKE_RTT}, opts [${cake_opts}]"
+      tc qdisc replace dev "${dev}" root cake rtt "${CAKE_RTT}" ${cake_opts}
     fi
-  fi
 
-  if [[ "${DISABLE_GRO_GSO_ON_VPN}" -eq 1 ]] && is_vpn_if "${DEV}"; then
-    if command -v ethtool >/dev/null 2>&1; then
-      ethtool -K "${DEV}" gro off gso off tso off 2>/dev/null || true
-      echo "  - Disabled GRO/GSO/TSO on ${DEV}"
+    if [[ "${ENABLE_INGRESS_SHAPING}" -eq 1 ]]; then
+      ifb="$(ifb_name "${dev}")"
+
+      if ! ip link show "${ifb}" >/dev/null 2>&1; then
+        ip link add "${ifb}" type ifb 2>/dev/null || {
+          warn "Failed to create IFB ${ifb}; skipping ingress shaping for ${dev}"
+          continue
+        }
+      fi
+
+      ip link set dev "${ifb}" up
+      ip link set dev "${ifb}" mtu "$(dev_mtu "${dev}")" || true
+
+      ensure_ingress_hook "${dev}"
+      tc filter replace dev "${dev}" ingress pref 1 protocol all matchall \
+        action mirred egress redirect dev "${ifb}"
+
+      cleanup_qdisc "${ifb}"
+
+      if [[ "${ENABLE_LIMITS}" -eq 1 ]]; then
+        echo "  - ingress CAKE@${ifb}: ${down_rate}, rtt ${CAKE_RTT}, opts [${cake_opts}] + ingress"
+        tc qdisc replace dev "${ifb}" root cake bandwidth "${down_rate}" rtt "${CAKE_RTT}" ${cake_opts} ingress
+      else
+        echo "  - ingress CAKE@${ifb}: unlimited, rtt ${CAKE_RTT}, opts [${cake_opts}] + ingress"
+        tc qdisc replace dev "${ifb}" root cake rtt "${CAKE_RTT}" ${cake_opts} ingress
+      fi
     fi
-  fi
-done
+
+    if [[ "${DISABLE_GRO_GSO_ON_VPN}" -eq 1 ]] && is_vpn_if "${dev}"; then
+      if command -v ethtool >/dev/null 2>&1; then
+        ethtool -K "${dev}" gro off gso off tso off 2>/dev/null || true
+        echo "  - Disabled GRO/GSO/TSO on ${dev}"
+      fi
+    fi
+  done
+}
 
 add_mss_if_absent(){
   local bin="$1"
-  local tbl="$2"
+  local table="$2"
   shift 2
 
   command -v "${bin}" >/dev/null 2>&1 || return 0
-  "${bin}" -t "${tbl}" -C "$@" 2>/dev/null || "${bin}" -t "${tbl}" -A "$@"
+  "${bin}" -t "${table}" -C "$@" 2>/dev/null || "${bin}" -t "${table}" -A "$@"
 }
 
-if [[ "${MSS_CLAMP_HOST_OUTPUT}" -eq 1 ]]; then
-  MSS_SCOPE="FORWARD + OUTPUT"
-else
-  MSS_SCOPE="FORWARD"
-fi
+delete_mss_if_present(){
+  local bin="$1"
+  local table="$2"
+  shift 2
 
-if [[ "${MSS_CLAMP_V4}" -eq 1 ]]; then
-  echo "[*] IPv4 MSS clamp: ${MSS_SCOPE}"
-  add_mss_if_absent iptables mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  command -v "${bin}" >/dev/null 2>&1 || return 0
+  while "${bin}" -t "${table}" -C "$@" 2>/dev/null; do
+    "${bin}" -t "${table}" -D "$@" 2>/dev/null || break
+  done
+}
 
+apply_mss(){
+  local scope
   if [[ "${MSS_CLAMP_HOST_OUTPUT}" -eq 1 ]]; then
-    add_mss_if_absent iptables mangle OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    scope="FORWARD + OUTPUT"
+  else
+    scope="FORWARD"
   fi
-fi
 
-if [[ "${MSS_CLAMP_V6}" -eq 1 ]]; then
-  echo "[*] IPv6 MSS clamp: ${MSS_SCOPE}"
-  add_mss_if_absent ip6tables mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-
-  if [[ "${MSS_CLAMP_HOST_OUTPUT}" -eq 1 ]]; then
-    add_mss_if_absent ip6tables mangle OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  if [[ "${MSS_CLAMP_V4}" -eq 1 ]]; then
+    log "IPv4 MSS clamp: ${scope}"
+    add_mss_if_absent iptables mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    if [[ "${MSS_CLAMP_HOST_OUTPUT}" -eq 1 ]]; then
+      add_mss_if_absent iptables mangle OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    fi
   fi
-fi
 
-echo
-echo "====== qdisc status ======"
-for DEV in "${!CANDIDATES[@]}"; do
-  echo "--- ${DEV} ---"
-  tc -s qdisc show dev "${DEV}" | sed -n '1,160p' || true
-
-  IFB="$(ifb_name "${DEV}")"
-  if ip link show "${IFB}" >/dev/null 2>&1; then
-    echo "--- ${IFB} ---"
-    tc -s qdisc show dev "${IFB}" | sed -n '1,160p' || true
+  if [[ "${MSS_CLAMP_V6}" -eq 1 ]]; then
+    log "IPv6 MSS clamp: ${scope}"
+    add_mss_if_absent ip6tables mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    if [[ "${MSS_CLAMP_HOST_OUTPUT}" -eq 1 ]]; then
+      add_mss_if_absent ip6tables mangle OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+    fi
   fi
-done
+}
 
-echo
-echo "[OK] Applied BBR + CAKE transit/exit shared-node profile."
-echo "[NOTE] tc qdisc and iptables MSS rules are runtime state. Use a systemd service to run this script at boot."
+cleanup_mss(){
+  delete_mss_if_present iptables mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  delete_mss_if_present iptables mangle OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  delete_mss_if_present ip6tables mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  delete_mss_if_present ip6tables mangle OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+}
+
+show_qdisc_status(){
+  echo
+  echo "====== qdisc status ======"
+
+  local dev ifb
+  for dev in "${!CANDIDATES[@]}"; do
+    echo "--- ${dev} ---"
+    tc -s qdisc show dev "${dev}" | sed -n '1,160p' || true
+
+    ifb="$(ifb_name "${dev}")"
+    if ip link show "${ifb}" >/dev/null 2>&1; then
+      echo "--- ${ifb} ---"
+      tc -s qdisc show dev "${ifb}" | sed -n '1,160p' || true
+    fi
+  done
+}
+
+apply_cmd(){
+  require_root
+  load_overrides
+  preflight
+  write_sysctl
+  detect_cake_nat
+  discover_candidates
+  apply_qdisc
+  apply_mss
+  show_qdisc_status
+  echo
+  ok "Applied BBR + CAKE transit/exit shared-node profile."
+  echo "[NOTE] Use '$0 install' to make tc qdisc and MSS rules persistent across reboot."
+}
+
+write_env_file(){
+  mkdir -p "$(dirname "${ENV_FILE}")"
+  cat >"${ENV_FILE}" <<EOF
+ENABLE_LIMITS="${ENABLE_LIMITS}"
+UP_RATE="${BANDWIDTH_UP_DEFAULT}"
+DOWN_RATE="${BANDWIDTH_DOWN_DEFAULT}"
+CAKE_RTT="${CAKE_RTT}"
+BASE_CAKE_OPTS="${BASE_CAKE_OPTS}"
+ENABLE_FORWARDING="${ENABLE_FORWARDING}"
+INCLUDE_VPN_PREFIX_INTERFACES="${INCLUDE_VPN_PREFIX_INTERFACES}"
+VPN_NAME_PREFIXES="${VPN_NAME_PREFIXES}"
+EXTRA_WAN_INTERFACES="${EXTRA_WAN_INTERFACES}"
+AUTO_ENABLE_CAKE_NAT="${AUTO_ENABLE_CAKE_NAT}"
+ENABLE_INGRESS_SHAPING="${ENABLE_INGRESS_SHAPING}"
+MSS_CLAMP_V4="${MSS_CLAMP_V4}"
+MSS_CLAMP_V6="${MSS_CLAMP_V6}"
+MSS_CLAMP_HOST_OUTPUT="${MSS_CLAMP_HOST_OUTPUT}"
+DISABLE_GRO_GSO_ON_VPN="${DISABLE_GRO_GSO_ON_VPN}"
+UP_OVERRIDES="${UP_OVERRIDES}"
+DOWN_OVERRIDES="${DOWN_OVERRIDES}"
+SCRIPT_URL="${SCRIPT_URL}"
+EOF
+}
+
+install_self(){
+  mkdir -p "$(dirname "${INSTALL_PATH}")"
+
+  local self="${BASH_SOURCE[0]:-$0}"
+  if [[ -r "${self}" && "${self}" != "bash" ]]; then
+    install -m 0755 "${self}" "${INSTALL_PATH}"
+    return 0
+  fi
+
+  log "Installing from ${SCRIPT_URL}"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "${SCRIPT_URL}" -o "${INSTALL_PATH}"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "${INSTALL_PATH}" "${SCRIPT_URL}"
+  else
+    die "Need curl or wget to install when running from stdin."
+  fi
+  chmod 0755 "${INSTALL_PATH}"
+}
+
+write_service_file(){
+  need_bin systemctl
+
+  cat >"${SERVICE_FILE}" <<EOF
+[Unit]
+Description=BBR + CAKE tuning for transit/exit shared node
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-${ENV_FILE}
+ExecStart=${INSTALL_PATH} apply
+ExecStop=${INSTALL_PATH} cleanup
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+install_cmd(){
+  require_root
+  load_overrides
+  preflight
+  install_self
+  write_env_file
+  write_service_file
+
+  systemctl daemon-reload
+  systemctl enable "${SERVICE_NAME}" >/dev/null
+  systemctl restart "${SERVICE_NAME}"
+
+  ok "Installed and enabled ${SERVICE_NAME}."
+  echo "[CONFIG] ${ENV_FILE}"
+  echo "[SCRIPT] ${INSTALL_PATH}"
+  echo "[SERVICE] ${SERVICE_FILE}"
+}
+
+cleanup_runtime(){
+  load_overrides
+  preflight
+  discover_candidates
+
+  local dev ifb
+  for dev in "${!CANDIDATES[@]}"; do
+    log "Cleaning qdisc on ${dev}"
+    cleanup_qdisc "${dev}"
+
+    ifb="$(ifb_name "${dev}")"
+    if ip link show "${ifb}" >/dev/null 2>&1; then
+      ip link delete "${ifb}" 2>/dev/null || true
+    fi
+  done
+
+  cleanup_mss
+  ok "Cleaned runtime qdisc/IFB/MSS state."
+}
+
+uninstall_cmd(){
+  require_root
+
+  if command -v systemctl >/dev/null 2>&1 && [[ -f "${SERVICE_FILE}" ]]; then
+    systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
+    systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  else
+    cleanup_runtime || true
+  fi
+
+  rm -f "${SERVICE_FILE}" "${ENV_FILE}" "${SYSCTL_FILE}" "${INSTALL_PATH}"
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+  fi
+
+  sysctl --system >/dev/null 2>&1 || true
+  ok "Uninstalled BBR + CAKE tuning files."
+}
+
+status_cmd(){
+  echo "====== sysctl ======"
+  sysctl net.ipv4.tcp_congestion_control 2>/dev/null || true
+  sysctl net.core.default_qdisc 2>/dev/null || true
+  sysctl net.ipv4.ip_forward 2>/dev/null || true
+  sysctl net.ipv6.conf.all.forwarding 2>/dev/null || true
+
+  echo
+  echo "====== service ======"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl is-enabled "${SERVICE_NAME}" 2>/dev/null || true
+    systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true
+  else
+    echo "systemctl not available"
+  fi
+
+  load_overrides
+  if command -v ip >/dev/null 2>&1 && command -v tc >/dev/null 2>&1; then
+    discover_candidates
+    show_qdisc_status
+  fi
+
+  echo
+  echo "====== MSS rules ======"
+  if command -v iptables >/dev/null 2>&1; then
+    iptables -t mangle -S 2>/dev/null | grep TCPMSS || true
+  fi
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -t mangle -S 2>/dev/null | grep TCPMSS || true
+  fi
+}
+
+main(){
+  local cmd="${1:-apply}"
+
+  case "${cmd}" in
+    apply)
+      apply_cmd
+      ;;
+    install)
+      install_cmd
+      ;;
+    status)
+      status_cmd
+      ;;
+    cleanup)
+      require_root
+      cleanup_runtime
+      ;;
+    uninstall)
+      uninstall_cmd
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      usage
+      die "Unknown command: ${cmd}"
+      ;;
+  esac
+}
+
+main "$@"
