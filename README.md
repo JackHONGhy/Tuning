@@ -14,22 +14,18 @@
 
 ## 一键安装（推荐）
 
-在 **Linux 服务器** 上执行：
+在 **Linux 中转服务器** 上以 root 执行（任选一条）：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning)
+curl -fsSL https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning | sudo bash
 ```
 
-若系统没有 process substitution，可用：
+```bash
+wget -qO- https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning | sudo bash
+```
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning -o /tmp/Tuning && chmod +x /tmp/Tuning && sudo bash /tmp/Tuning
-```
-
-或：
-
-```bash
-wget -qO /tmp/Tuning https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning && chmod +x /tmp/Tuning && sudo bash /tmp/Tuning
 ```
 
 ### 自动完成
