@@ -8,19 +8,26 @@
 # Commands: auto (default), detect, apply, install, status, cleanup, uninstall, help
 # Requirements: Linux kernel >= 5.4, iproute2 tc, sch_cake/ifb support.
 #
-# One-shot on server:
-#   curl -fsSL <url> | bash
-#   # or
+# One-shot on Debian/Ubuntu:
+#   wget -qO- https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning | sudo bash
+# Local file:
 #   sudo bash Tuning
 set -euo pipefail
 
-VERSION="2.1.0"
+VERSION="3.1.0"
 INSTALL_PATH="/usr/local/sbin/bbr-cake-transit-exit"
 SERVICE_NAME="bbr-cake-transit-exit.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
+RETUNE_SERVICE_NAME="bbr-cake-transit-exit-retune.service"
+RETUNE_SERVICE_FILE="/etc/systemd/system/${RETUNE_SERVICE_NAME}"
+RETUNE_TIMER_NAME="bbr-cake-transit-exit-retune.timer"
+RETUNE_TIMER_FILE="/etc/systemd/system/${RETUNE_TIMER_NAME}"
 ENV_FILE="/etc/default/bbr-cake-transit-exit"
 SYSCTL_FILE="/etc/sysctl.d/99-bbr-cake-transit-exit.conf"
 DETECT_CACHE_FILE="/var/cache/bbr-cake-transit-exit/last-detect.env"
+PROGRESS_FILE="/var/cache/bbr-cake-transit-exit/progress.txt"
+RETUNE_LOG_DIR="/var/log/bbr-cake-transit-exit"
+RETUNE_LOG_FILE="${RETUNE_LOG_DIR}/retune.log"
 SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning}"
 
 # ---------- CLI / env overrides (highest priority) ----------
@@ -57,6 +64,18 @@ OVERRIDE_PROFILE="${PROFILE:-}"
 OVERRIDE_USE_DETECT_CACHE="${USE_DETECT_CACHE:-}"
 OVERRIDE_AUTO_INSTALL="${AUTO_INSTALL:-}"
 OVERRIDE_SKIP_DETECT="${SKIP_DETECT:-}"
+OVERRIDE_MAX_RATE="${MAX_RATE:-}"
+OVERRIDE_MAX_UP_RATE="${MAX_UP_RATE:-}"
+OVERRIDE_MAX_DOWN_RATE="${MAX_DOWN_RATE:-}"
+OVERRIDE_DETECT_ROUNDS="${DETECT_ROUNDS:-}"
+OVERRIDE_AGGREGATE_MODE="${AGGREGATE_MODE:-}"
+OVERRIDE_DAILY_RETEST="${DAILY_RETEST:-}"
+OVERRIDE_RETEST_HOUR="${RETEST_HOUR:-}"
+OVERRIDE_RETEST_MINUTE="${RETEST_MINUTE:-}"
+OVERRIDE_CPU_INGRESS_OFF_LOAD="${CPU_INGRESS_OFF_LOAD:-}"
+OVERRIDE_CPU_INGRESS_ON_LOAD="${CPU_INGRESS_ON_LOAD:-}"
+OVERRIDE_REGION="${REGION:-}"
+OVERRIDE_CPU_CAP_RATES="${CPU_CAP_RATES:-}"
 
 if [[ -f "${ENV_FILE}" ]]; then
   # shellcheck disable=SC1090
@@ -75,6 +94,9 @@ VPN_NAME_PREFIXES="${OVERRIDE_VPN_NAME_PREFIXES:-${VPN_NAME_PREFIXES:-wg tun ppp
 EXTRA_WAN_INTERFACES="${OVERRIDE_EXTRA_WAN_INTERFACES:-${EXTRA_WAN_INTERFACES:-}}"
 AUTO_ENABLE_CAKE_NAT="${OVERRIDE_AUTO_ENABLE_CAKE_NAT:-${AUTO_ENABLE_CAKE_NAT:-1}}"
 ENABLE_INGRESS_SHAPING="${OVERRIDE_ENABLE_INGRESS_SHAPING:-${ENABLE_INGRESS_SHAPING:-1}}"
+# If user passed ENABLE_INGRESS_SHAPING on CLI, CPU policy will not force-toggle it
+INGRESS_USER_SET=0
+[[ -n "${OVERRIDE_ENABLE_INGRESS_SHAPING}" ]] && INGRESS_USER_SET=1
 MSS_CLAMP_V4="${OVERRIDE_MSS_CLAMP_V4:-${MSS_CLAMP_V4:-1}}"
 MSS_CLAMP_V6="${OVERRIDE_MSS_CLAMP_V6:-${MSS_CLAMP_V6:-1}}"
 MSS_CLAMP_HOST_OUTPUT="${OVERRIDE_MSS_CLAMP_HOST_OUTPUT:-${MSS_CLAMP_HOST_OUTPUT:-1}}"
@@ -82,7 +104,8 @@ DISABLE_GRO_GSO_ON_VPN="${OVERRIDE_DISABLE_GRO_GSO_ON_VPN:-${DISABLE_GRO_GSO_ON_
 UP_OVERRIDES="${OVERRIDE_UP_OVERRIDES:-${UP_OVERRIDES:-}}"
 DOWN_OVERRIDES="${OVERRIDE_DOWN_OVERRIDES:-${DOWN_OVERRIDES:-}}"
 BANDWIDTH_SOURCE="${OVERRIDE_BANDWIDTH_SOURCE:-${BANDWIDTH_SOURCE:-none}}"
-BANDWIDTH_SAFETY_FACTOR="${OVERRIDE_BANDWIDTH_SAFETY_FACTOR:-${BANDWIDTH_SAFETY_FACTOR:-0.92}}"
+# Production transit: slightly under measured bottleneck (not 100%, not even 92%)
+BANDWIDTH_SAFETY_FACTOR="${OVERRIDE_BANDWIDTH_SAFETY_FACTOR:-${BANDWIDTH_SAFETY_FACTOR:-0.85}}"
 AUTO_DETECT_BW="${OVERRIDE_AUTO_DETECT_BW:-${AUTO_DETECT_BW:-0}}"
 AUTO_CONFIRM_PEAK="${OVERRIDE_AUTO_CONFIRM_PEAK:-${AUTO_CONFIRM_PEAK:-0}}"
 DETECT_METHODS="${OVERRIDE_DETECT_METHODS:-${DETECT_METHODS:-http,speedtest,iperf3,bench}}"
@@ -98,6 +121,35 @@ USE_DETECT_CACHE="${OVERRIDE_USE_DETECT_CACHE:-${USE_DETECT_CACHE:-1}}"
 AUTO_INSTALL="${OVERRIDE_AUTO_INSTALL:-${AUTO_INSTALL:-1}}"
 # auto 模式：跳过测速（仅当已手填 UP/DOWN 时有用）
 SKIP_DETECT="${OVERRIDE_SKIP_DETECT:-${SKIP_DETECT:-0}}"
+# 1=测速子进程实时打印到屏幕（默认开）；0=安静模式只写日志文件
+LIVE_OUTPUT="${LIVE_OUTPUT:-1}"
+# Hard caps (Mbit integer or rate string). Empty = only soft CPU-core cap when CPU_CAP_RATES=1
+MAX_RATE="${OVERRIDE_MAX_RATE:-${MAX_RATE:-}}"
+MAX_UP_RATE="${OVERRIDE_MAX_UP_RATE:-${MAX_UP_RATE:-${MAX_RATE:-}}}"
+MAX_DOWN_RATE="${OVERRIDE_MAX_DOWN_RATE:-${MAX_DOWN_RATE:-${MAX_RATE:-}}}"
+# Multi-round detect: quick methods re-run; bench only once (too slow)
+DETECT_ROUNDS="${OVERRIDE_DETECT_ROUNDS:-${DETECT_ROUNDS:-3}}"
+# median | max | min  — production transit prefers median
+AGGREGATE_MODE="${OVERRIDE_AGGREGATE_MODE:-${AGGREGATE_MODE:-median}}"
+# Daily retune at Beijing time (Asia/Shanghai)
+DAILY_RETEST="${OVERRIDE_DAILY_RETEST:-${DAILY_RETEST:-1}}"
+RETEST_HOUR="${OVERRIDE_RETEST_HOUR:-${RETEST_HOUR:-3}}"
+RETEST_MINUTE="${OVERRIDE_RETEST_MINUTE:-${RETEST_MINUTE:-0}}"
+# CPU load% hysteresis for ingress (1-min load / nproc * 100)
+CPU_INGRESS_OFF_LOAD="${OVERRIDE_CPU_INGRESS_OFF_LOAD:-${CPU_INGRESS_OFF_LOAD:-90}}"
+CPU_INGRESS_ON_LOAD="${OVERRIDE_CPU_INGRESS_ON_LOAD:-${CPU_INGRESS_ON_LOAD:-70}}"
+# asia | eu | us | far | auto — 中转路径档位（auto 可地理识别 + RTT 回退）
+REGION="${OVERRIDE_REGION:-${REGION:-auto}}"
+# REGION=auto 时是否查询公网 IP 地理位置（1=开，失败则 ping RTT 回退）
+GEO_DETECT="${GEO_DETECT:-1}"
+# Soft per-core rate caps (1c~800M 2c~3G 4c+~10G) when no MAX_RATE set
+CPU_CAP_RATES="${OVERRIDE_CPU_CAP_RATES:-${CPU_CAP_RATES:-1}}"
+# Filled by geo/region resolve (for status / logs)
+DETECTED_GEO=""
+DETECTED_COUNTRY=""
+DETECTED_REGION=""
+REGION_PROFILE=""
+REGION_NOTE=""
 
 # host profile: no forwarding, keep rp_filter stricter via write_sysctl
 if [[ "${PROFILE}" == "host" ]]; then
@@ -119,10 +171,73 @@ PEAK_DOWN_MBIT=""
 SUGGEST_UP=""
 SUGGEST_DOWN=""
 
+# ---------- progress / logging (line-buffered, visible under pipe|bash) ----------
 log(){ printf '[*] %s\n' "$*"; }
 ok(){ printf '[OK] %s\n' "$*"; }
 warn(){ printf '[WARN] %s\n' "$*" >&2; }
 die(){ printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+
+ts_now(){ date '+%H:%M:%S' 2>/dev/null || echo '--:--:--'; }
+
+# Big stage banner: phase current/total title
+phase(){
+  local cur="$1" total="$2" title="$3"
+  echo
+  echo "══════════════════════════════════════════════"
+  printf ' ▶ 阶段 %s/%s  |  %s  |  %s\n' "${cur}" "${total}" "$(ts_now)" "${title}"
+  echo "══════════════════════════════════════════════"
+}
+
+# Sub-step within a phase
+step(){
+  printf '\n>>> [%s] %s\n' "$(ts_now)" "$*"
+}
+
+# Persist progress for status / parallel SSH watchers
+# usage: progress_set STEP TOTAL TITLE [DETAIL]
+progress_set(){
+  local cur="$1" total="$2" title="$3" detail="${4:-}"
+  mkdir -p "$(dirname "${PROGRESS_FILE}")" 2>/dev/null || true
+  {
+    echo "timestamp=$(date -Is 2>/dev/null || date)"
+    echo "beijing=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date)"
+    echo "step=${cur}"
+    echo "total=${total}"
+    echo "title=${title}"
+    echo "detail=${detail}"
+    echo "version=${VERSION}"
+    echo "pid=$$"
+  } >"${PROGRESS_FILE}" 2>/dev/null || true
+  phase "${cur}" "${total}" "${title}"
+  [[ -n "${detail}" ]] && log "${detail}"
+}
+
+progress_done(){
+  progress_set "${1:-1}" "${1:-1}" "完成" "${2:-ok}"
+}
+
+# Run command with live console output + capture file (for parsing)
+# Usage: run_live /path/out.txt cmd [args...]
+run_live(){
+  local out="$1"
+  shift
+  local rc=0
+  if [[ "${LIVE_OUTPUT}" != "1" ]]; then
+    "$@" >"${out}" 2>&1 || rc=$?
+    return "${rc}"
+  fi
+  # Prefer line-buffered so progress appears immediately (esp. under curl|bash)
+  # Temporarily disable -e: pipelines + pipefail would abort the whole script
+  set +e
+  if command -v stdbuf >/dev/null 2>&1; then
+    stdbuf -oL -eL "$@" 2>&1 | tee "${out}"
+  else
+    "$@" 2>&1 | tee "${out}"
+  fi
+  rc="${PIPESTATUS[0]:-0}"
+  set -e
+  return "${rc}"
+}
 
 require_root(){
   [[ ${EUID} -eq 0 ]] || die "Please run as root."
@@ -142,50 +257,62 @@ is_tty(){
 
 usage(){
   cat <<EOF
-BBR + CAKE 中转调优 v${VERSION}
+BBR + CAKE 中转调优 v${VERSION} (Transit Production)
 
-一键（默认，无需再分步执行）:
+一键安装（Debian/Ubuntu 推荐）:
+  wget -qO- https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning | sudo bash
+
+本地文件:
   sudo bash $0
   sudo bash $0 auto
 
-流程: 多方法测速 → 取峰值×安全系数自动填入 → 应用 BBR+CAKE → 安装开机持久化
-无交互确认。测速会短时打满带宽。
+流程:
+  多轮测速(默认3轮,bench仅1轮) → ${AGGREGATE_MODE:-median}聚合
+  → ×${BANDWIDTH_SAFETY_FACTOR:-0.85} → 上限/CPU保护 → 应用 BBR+CAKE
+  → systemd 开机恢复 + 北京时间每日凌晨重测
+
+可视化:
+  屏幕阶段横幅 + 实时测速输出 (LIVE_OUTPUT=1)
+  进度文件: ${PROGRESS_FILE}
+  状态: $0 status   |  日志: ${RETUNE_LOG_FILE}
 
 其它命令:
-  $0 detect      仅测速并写缓存（可交互）
-  $0 apply       仅应用（用手动速率/缓存/配置，默认不重新测速）
-  $0 install     安装脚本并启用 systemd
-  $0 status      查看状态
-  $0 cleanup     清理运行时 qdisc/IFB/MSS
+  $0 detect      仅测速
+  $0 retune      立即重测并应用（同每日任务）
+  $0 apply       用已有配置应用
+  $0 install     安装 + 定时器
+  $0 status      状态/进度/定时器/日志
+  $0 cleanup     清理 qdisc
   $0 uninstall   卸载
-  $0 help        帮助
-
-测速方法 DETECT_METHODS（默认 http,speedtest,iperf3,bench）:
-  http / speedtest / iperf3(需 IPERF3_SERVER) / bench(auto 默认允许远程 bench)
+  $0 help
 
 示例:
-  # 中转机一键全自动
   sudo bash $0
-
-  # 指定 iperf3 对端后一键
-  sudo IPERF3_SERVER=1.2.3.4 bash $0
-
-  # 已知带宽，跳过测速直接应用+安装
+  sudo REGION=asia bash $0
+  sudo REGION=us bash $0
+  sudo MAX_RATE=2000Mbit bash $0
+  sudo BANDWIDTH_SAFETY_FACTOR=0.85 DETECT_ROUNDS=3 bash $0
   sudo UP_RATE=90Mbit DOWN_RATE=900Mbit SKIP_DETECT=1 bash $0
+  sudo DAILY_RETEST=0 bash $0          # 关闭每日重测
+  sudo RETEST_HOUR=4 RETEST_MINUTE=30 bash $0
+  sudo bash $0 retune                  # 手动立刻重测
+  watch -n2 cat ${PROGRESS_FILE}       # 另开窗口看进度
 
-  # 只测速不应用
-  sudo bash $0 detect
+环境变量要点:
+  BANDWIDTH_SAFETY_FACTOR=0.85   AGGREGATE_MODE=median|max|min
+  DETECT_ROUNDS=3   MAX_RATE / MAX_UP_RATE / MAX_DOWN_RATE
+  DAILY_RETEST=1  RETEST_HOUR=3  RETEST_MINUTE=0 (Asia/Shanghai)
+  CPU_INGRESS_OFF_LOAD=90  CPU_INGRESS_ON_LOAD=70  CPU_CAP_RATES=1
+  REGION=auto|asia|eu|us|far   GEO_DETECT=1
+  LIVE_OUTPUT=1
+  DETECT_METHODS IPERF3_SERVER ALLOW_REMOTE_BENCH PROFILE=transit|host
 
-  # 一键但不装 systemd（只当次生效）
-  sudo AUTO_INSTALL=0 bash $0
-
-  # 禁止远程 bench
-  sudo ALLOW_REMOTE_BENCH=0 bash $0
-
-环境变量:
-  UP_RATE DOWN_RATE CAKE_RTT BANDWIDTH_SAFETY_FACTOR=0.92
-  DETECT_METHODS IPERF3_SERVER AUTO_INSTALL=1 SKIP_DETECT=0
-  ALLOW_REMOTE_BENCH BENCH_URL HTTP_TEST_URLS PROFILE=transit|host
+地区档位 (REGION):
+  asia  RTT≈65ms  factor 0.85   日/港/新/韩/国内等
+  eu    RTT≈100ms factor 0.85   欧洲
+  us    RTT≈150ms factor 0.82   北美/美亚
+  far   RTT≈200ms factor 0.80   澳新/南美/非洲/中东等更远
+  auto  公网IP地理识别 → 失败则用 ping RTT 分档 (GEO_DETECT=0 仅RTT)
 EOF
 }
 
@@ -239,7 +366,7 @@ mbit_to_rate(){
 # Apply safety factor to integer Mbit → rate string
 mbit_with_safety(){
   local m="${1:-0}"
-  local f="${BANDWIDTH_SAFETY_FACTOR:-0.92}"
+  local f="${BANDWIDTH_SAFETY_FACTOR:-0.85}"
   local out
   out="$(awk -v m="${m}" -v f="${f}" 'BEGIN{
     if (m<=0) { print 0; exit }
@@ -253,6 +380,368 @@ mbit_with_safety(){
 max_int(){
   local a="${1:-0}" b="${2:-0}"
   [[ "${a}" -gt "${b}" ]] && printf '%s' "${a}" || printf '%s' "${b}"
+}
+
+min_int(){
+  local a="${1:-0}" b="${2:-0}"
+  [[ "${a}" -lt "${b}" ]] && printf '%s' "${a}" || printf '%s' "${b}"
+}
+
+# Median of integers passed as args (ignores empty). Needs at least 1 value.
+median_int(){
+  local -a vals=()
+  local v
+  for v in "$@"; do
+    [[ -n "${v}" && "${v}" =~ ^[0-9]+$ && "${v}" -gt 0 ]] || continue
+    vals+=("${v}")
+  done
+  local n="${#vals[@]}"
+  if [[ "${n}" -eq 0 ]]; then
+    printf ''
+    return 0
+  fi
+  local sorted
+  sorted="$(printf '%s\n' "${vals[@]}" | sort -n)"
+  local -a s=()
+  while IFS= read -r v; do
+    [[ -n "${v}" ]] && s+=("${v}")
+  done <<<"${sorted}"
+  n="${#s[@]}"
+  local mid=$(( (n - 1) / 2 ))
+  if [[ $((n % 2)) -eq 1 ]]; then
+    printf '%s' "${s[mid]}"
+  else
+    # even: average of two middle, integer
+    awk -v a="${s[mid]}" -v b="${s[$((mid + 1))]}" 'BEGIN{printf "%d", int((a+b)/2+0.5)}'
+  fi
+}
+
+cpu_nproc(){
+  local n
+  n="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+  [[ "${n}" -ge 1 ]] || n=1
+  printf '%s' "${n}"
+}
+
+# 1-min load average as percent of one full core set (100 = all cores busy)
+cpu_load_pct(){
+  local load cores pct
+  load="$(awk '{print $1}' /proc/loadavg 2>/dev/null || echo 0)"
+  cores="$(cpu_nproc)"
+  pct="$(awk -v l="${load}" -v c="${cores}" 'BEGIN{
+    if (c<=0) c=1
+    printf "%d", int((l/c)*100+0.5)
+  }')"
+  printf '%s' "${pct}"
+}
+
+# Soft max Mbit by CPU cores when CPU_CAP_RATES=1 and no MAX_* set
+cpu_soft_max_mbit(){
+  local cores
+  cores="$(cpu_nproc)"
+  if [[ "${cores}" -le 1 ]]; then
+    printf '800'
+  elif [[ "${cores}" -eq 2 ]]; then
+    printf '3000'
+  elif [[ "${cores}" -eq 3 ]]; then
+    printf '5000'
+  else
+    printf '10000'
+  fi
+}
+
+# Cap integer Mbit by MAX_* and optional CPU soft cap → print Mbit or empty
+cap_mbit(){
+  local m="${1:-}" which="${2:-both}" # up|down|both
+  [[ -n "${m}" && "${m}" -gt 0 ]] || { printf ''; return 0; }
+  local cap="" soft=""
+  case "${which}" in
+    up) cap="$(rate_to_mbit "${MAX_UP_RATE:-}")" ;;
+    down) cap="$(rate_to_mbit "${MAX_DOWN_RATE:-}")" ;;
+    *) cap="$(rate_to_mbit "${MAX_RATE:-}")" ;;
+  esac
+  if [[ -z "${cap}" || "${cap}" -le 0 ]]; then
+    if [[ "${CPU_CAP_RATES}" == "1" ]]; then
+      soft="$(cpu_soft_max_mbit)"
+      cap="${soft}"
+    fi
+  fi
+  if [[ -n "${cap}" && "${cap}" -gt 0 && "${m}" -gt "${cap}" ]]; then
+    log "  rate cap: ${m} → ${cap} Mbit (${which})"
+    m="${cap}"
+  fi
+  printf '%s' "${m}"
+}
+
+# Apply safety factor then caps → rate string
+mbit_to_suggest(){
+  local m="$1" which="${2:-both}"
+  m="$(cap_mbit "${m}" "${which}")"
+  [[ -n "${m}" ]] || { printf ''; return 0; }
+  mbit_with_safety "${m}"
+}
+
+# CPU-aware ingress: high load → disable IFB ingress shaping
+maybe_adjust_ingress_for_cpu(){
+  [[ "${INGRESS_USER_SET}" -eq 1 ]] && {
+    log "ENABLE_INGRESS_SHAPING set by user (${ENABLE_INGRESS_SHAPING}); skip CPU auto-toggle"
+    return 0
+  }
+  local cores loadpct
+  cores="$(cpu_nproc)"
+  loadpct="$(cpu_load_pct)"
+  log "CPU: cores=${cores} load≈${loadpct}% (off≥${CPU_INGRESS_OFF_LOAD}% on≤${CPU_INGRESS_ON_LOAD}%)"
+
+  if [[ "${cores}" -eq 1 && "${ENABLE_INGRESS_SHAPING}" == "1" && "${loadpct}" -ge 50 ]]; then
+    warn "1-core host under load → disabling ingress shaping (egress CAKE kept)"
+    ENABLE_INGRESS_SHAPING=0
+    return 0
+  fi
+  if [[ "${loadpct}" -ge "${CPU_INGRESS_OFF_LOAD}" && "${ENABLE_INGRESS_SHAPING}" == "1" ]]; then
+    warn "CPU load ${loadpct}% ≥ ${CPU_INGRESS_OFF_LOAD}% → disable ingress"
+    ENABLE_INGRESS_SHAPING=0
+  elif [[ "${loadpct}" -le "${CPU_INGRESS_ON_LOAD}" && "${ENABLE_INGRESS_SHAPING}" == "0" ]]; then
+    # only auto re-enable if not user-forced off permanently — we default was 1
+    log "CPU load ${loadpct}% ≤ ${CPU_INGRESS_ON_LOAD}% → enable ingress"
+    ENABLE_INGRESS_SHAPING=1
+  fi
+}
+
+# Map ISO country code → profile: asia | eu | us | far
+country_to_region(){
+  local cc
+  cc="$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]')"
+  [[ -n "${cc}" ]] || { printf ''; return 0; }
+  case "${cc}" in
+    # East / SE / South Asia + nearby hubs
+    CN|HK|MO|TW|JP|KR|SG|MY|TH|VN|PH|ID|IN|BD|PK|LK|KH|LA|MM|BN|MN|NP|BT)
+      printf 'asia' ;;
+    # Europe (incl. UK, Nordic, East EU, Turkey)
+    DE|FR|NL|GB|UK|IE|BE|LU|CH|AT|IT|ES|PT|SE|NO|DK|FI|PL|CZ|SK|HU|RO|BG|GR|HR|SI|RS|UA|RU|TR|IS|EE|LV|LT|MD|AL|MK|BA|ME|XK)
+      printf 'eu' ;;
+    # North America
+    US|CA|MX|PR|VI)
+      printf 'us' ;;
+    # Farther: Oceania, South America, Africa, Middle East (often longer/jittery to CN users)
+    AU|NZ|FJ|PG|BR|AR|CL|CO|PE|UY|PY|BO|EC|VE|ZA|NG|EG|KE|MA|GH|TZ|ET|AE|SA|QA|KW|BH|OM|IL|IQ|IR|JO)
+      printf 'far' ;;
+    *)
+      printf '' ;;
+  esac
+}
+
+# Query public IP geo (best-effort, short timeout). Sets DETECTED_* globals.
+# Returns 0 if DETECTED_REGION set.
+geo_detect_region(){
+  DETECTED_GEO=""
+  DETECTED_COUNTRY=""
+  DETECTED_REGION=""
+  [[ "${GEO_DETECT}" == "1" ]] || return 1
+
+  local body="" cc="" city="" org="" src=""
+
+  # 1) ipapi.co
+  if have_bin curl; then
+    body="$(curl -fsS --max-time 4 'https://ipapi.co/json/' 2>/dev/null || true)"
+  elif have_bin wget; then
+    body="$(wget -qO- --timeout=4 'https://ipapi.co/json/' 2>/dev/null || true)"
+  fi
+  if [[ -n "${body}" ]]; then
+    cc="$(printf '%s' "${body}" | grep -oE '"country(_code)?"[[:space:]]*:[[:space:]]*"[A-Za-z]{2}"' | head -1 | grep -oE '[A-Za-z]{2}"$' | tr -d '"')"
+    [[ -z "${cc}" ]] && cc="$(printf '%s' "${body}" | grep -oE '"country"[[:space:]]*:[[:space:]]*"[A-Za-z]{2}"' | head -1 | grep -oE '[A-Za-z]{2}')"
+    city="$(printf '%s' "${body}" | grep -oE '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')"
+    if [[ -n "${cc}" ]]; then
+      src="ipapi.co"
+    fi
+  fi
+
+  # 2) ip-api.com (HTTP; many VPS allow it)
+  if [[ -z "${cc}" ]]; then
+    body=""
+    if have_bin curl; then
+      body="$(curl -fsS --max-time 4 'http://ip-api.com/json/?fields=status,country,countryCode,city,isp,query' 2>/dev/null || true)"
+    elif have_bin wget; then
+      body="$(wget -qO- --timeout=4 'http://ip-api.com/json/?fields=status,country,countryCode,city,isp,query' 2>/dev/null || true)"
+    fi
+    if printf '%s' "${body}" | grep -q '"status"[[:space:]]*:[[:space:]]*"success"'; then
+      cc="$(printf '%s' "${body}" | grep -oE '"countryCode"[[:space:]]*:[[:space:]]*"[A-Za-z]{2}"' | head -1 | grep -oE '[A-Za-z]{2}')"
+      city="$(printf '%s' "${body}" | grep -oE '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')"
+      org="$(printf '%s' "${body}" | grep -oE '"isp"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')"
+      src="ip-api.com"
+    fi
+  fi
+
+  # 3) ipinfo.io
+  if [[ -z "${cc}" ]]; then
+    body=""
+    if have_bin curl; then
+      body="$(curl -fsS --max-time 4 'https://ipinfo.io/json' 2>/dev/null || true)"
+    elif have_bin wget; then
+      body="$(wget -qO- --timeout=4 'https://ipinfo.io/json' 2>/dev/null || true)"
+    fi
+    if [[ -n "${body}" ]]; then
+      cc="$(printf '%s' "${body}" | grep -oE '"country"[[:space:]]*:[[:space:]]*"[A-Za-z]{2}"' | head -1 | grep -oE '[A-Za-z]{2}')"
+      city="$(printf '%s' "${body}" | grep -oE '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')"
+      org="$(printf '%s' "${body}" | grep -oE '"org"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')"
+      src="ipinfo.io"
+    fi
+  fi
+
+  [[ -n "${cc}" ]] || {
+    warn "Geo detect failed (timeout/blocked); will use RTT fallback"
+    return 1
+  }
+
+  DETECTED_COUNTRY="${cc}"
+  DETECTED_GEO="${city:-?} / ${cc}"
+  [[ -n "${org}" ]] && DETECTED_GEO="${DETECTED_GEO} (${org})"
+  DETECTED_REGION="$(country_to_region "${cc}")"
+  if [[ -z "${DETECTED_REGION}" ]]; then
+    warn "Country ${cc} not in map; RTT fallback"
+    return 1
+  fi
+  log "Geo detect via ${src}: ${DETECTED_GEO} → profile=${DETECTED_REGION}"
+  return 0
+}
+
+# Apply profile defaults: CAKE_RTT + safety factor (if not user-overridden)
+# $1 = profile asia|eu|us|far
+apply_region_profile(){
+  local prof="$1"
+  REGION_PROFILE="${prof}"
+  case "${prof}" in
+    asia|jp|hk|sg|cn|kr)
+      REGION_PROFILE="asia"
+      REGION_NOTE="亚洲中转 50–80ms 带，系数偏标准"
+      [[ -z "${OVERRIDE_CAKE_RTT}" ]] && CAKE_RTT="65ms"
+      if [[ -z "${OVERRIDE_BANDWIDTH_SAFETY_FACTOR}" ]]; then
+        # only nudge if still generic default
+        BANDWIDTH_SAFETY_FACTOR="${BANDWIDTH_SAFETY_FACTOR:-0.85}"
+        # keep 0.85 for asia
+        [[ "${BANDWIDTH_SAFETY_FACTOR}" == "0.85" || "${BANDWIDTH_SAFETY_FACTOR}" == "0.92" ]] && BANDWIDTH_SAFETY_FACTOR="0.85"
+      fi
+      ;;
+    eu|europe|de|nl|uk|gb)
+      REGION_PROFILE="eu"
+      REGION_NOTE="欧洲中转 80–120ms 带"
+      [[ -z "${OVERRIDE_CAKE_RTT}" ]] && CAKE_RTT="100ms"
+      if [[ -z "${OVERRIDE_BANDWIDTH_SAFETY_FACTOR}" ]]; then
+        BANDWIDTH_SAFETY_FACTOR="0.85"
+      fi
+      ;;
+    us|na|america|ca)
+      REGION_PROFILE="us"
+      REGION_NOTE="北美/美亚 120–180ms 带，跨洋略保守"
+      [[ -z "${OVERRIDE_CAKE_RTT}" ]] && CAKE_RTT="150ms"
+      if [[ -z "${OVERRIDE_BANDWIDTH_SAFETY_FACTOR}" ]]; then
+        BANDWIDTH_SAFETY_FACTOR="0.82"
+      fi
+      ;;
+    far|oceania|sa|africa|me|long)
+      REGION_PROFILE="far"
+      REGION_NOTE="更远路径 180–250ms 带，更保守折扣"
+      [[ -z "${OVERRIDE_CAKE_RTT}" ]] && CAKE_RTT="200ms"
+      if [[ -z "${OVERRIDE_BANDWIDTH_SAFETY_FACTOR}" ]]; then
+        BANDWIDTH_SAFETY_FACTOR="0.80"
+      fi
+      ;;
+    *)
+      REGION_PROFILE="unknown"
+      REGION_NOTE="未知档位"
+      return 1
+      ;;
+  esac
+  log "Region profile [${REGION_PROFILE}]: CAKE_RTT=${CAKE_RTT} safety=${BANDWIDTH_SAFETY_FACTOR} — ${REGION_NOTE}"
+  return 0
+}
+
+# Map measured RTT (ms number) → profile when geo unavailable
+rtt_ms_to_region(){
+  local ms="${1:-0}"
+  ms="$(printf '%s' "${ms}" | awk '{printf "%d", $1+0}')"
+  if [[ "${ms}" -le 0 ]]; then
+    printf 'asia'
+  elif [[ "${ms}" -lt 90 ]]; then
+    printf 'asia'
+  elif [[ "${ms}" -lt 140 ]]; then
+    printf 'eu'
+  elif [[ "${ms}" -lt 200 ]]; then
+    printf 'us'
+  else
+    printf 'far'
+  fi
+}
+
+# Full resolver: manual REGION → geo → ping RTT → keep defaults
+resolve_cake_rtt(){
+  resolve_region_tuning
+}
+
+resolve_region_tuning(){
+  local reg="${REGION:-auto}"
+  reg="$(printf '%s' "${reg}" | tr '[:upper:]' '[:lower:]')"
+
+  # Explicit user region (not auto)
+  case "${reg}" in
+    asia|jp|hk|sg|cn|kr|eu|europe|de|nl|uk|gb|us|na|america|ca|far|oceania|sa|africa|me|long)
+      DETECTED_REGION="${reg}"
+      case "${reg}" in
+        jp|hk|sg|cn|kr) DETECTED_REGION="asia" ;;
+        europe|de|nl|uk|gb) DETECTED_REGION="eu" ;;
+        na|america|ca) DETECTED_REGION="us" ;;
+        oceania|sa|africa|me|long) DETECTED_REGION="far" ;;
+      esac
+      apply_region_profile "${DETECTED_REGION}"
+      log "REGION=${reg} (manual) → profile=${REGION_PROFILE}"
+      return 0
+      ;;
+  esac
+
+  # auto: geo first
+  step "识别服务器位置 / 选择地区调优档位"
+  if [[ "${reg}" == "auto" ]] && geo_detect_region; then
+    apply_region_profile "${DETECTED_REGION}"
+    # Fine-tune RTT with ping if user did not force CAKE_RTT
+    if [[ -z "${OVERRIDE_CAKE_RTT}" ]]; then
+      local rtt_s rtt_ms
+      rtt_s="$(suggest_rtt_from_ping 1.1.1.1 || true)"
+      if [[ -n "${rtt_s}" ]]; then
+        rtt_ms="$(printf '%s' "${rtt_s}" | grep -oE '[0-9]+' | head -1)"
+        # If geo says asia but ping RTT is huge, bump toward longer profile hint only on RTT value
+        if [[ -n "${rtt_ms}" && "${rtt_ms}" -gt 0 ]]; then
+          # Blend: use max(profile_default_ms, ping_suggest_ms) lightly — prefer ping if much larger
+          local prof_ms
+          prof_ms="$(printf '%s' "${CAKE_RTT}" | grep -oE '[0-9]+' | head -1)"
+          if [[ -n "${prof_ms}" && "${rtt_ms}" -gt $((prof_ms + 40)) ]]; then
+            CAKE_RTT="${rtt_s}"
+            log "Ping RTT ${rtt_ms}ms >> profile ${prof_ms}ms → use CAKE_RTT=${CAKE_RTT}"
+          fi
+        fi
+      fi
+    fi
+    return 0
+  fi
+
+  # RTT-only fallback
+  local rtt_s rtt_ms prof
+  rtt_s="$(suggest_rtt_from_ping 1.1.1.1 || true)"
+  if [[ -n "${rtt_s}" ]]; then
+    rtt_ms="$(printf '%s' "${rtt_s}" | grep -oE '[0-9]+' | head -1)"
+    prof="$(rtt_ms_to_region "${rtt_ms}")"
+    DETECTED_REGION="${prof}"
+    DETECTED_GEO="RTT≈${rtt_ms}ms (no geo)"
+    apply_region_profile "${prof}"
+    if [[ -z "${OVERRIDE_CAKE_RTT}" ]]; then
+      CAKE_RTT="${rtt_s}"
+      log "RTT fallback CAKE_RTT=${CAKE_RTT} profile=${prof}"
+    fi
+    return 0
+  fi
+
+  warn "Geo+RTT both failed; keep CAKE_RTT=${CAKE_RTT} safety=${BANDWIDTH_SAFETY_FACTOR}"
+  REGION_PROFILE="default"
+  REGION_NOTE="无地理/无RTT，使用当前默认"
+  return 0
 }
 
 parse_overrides(){
@@ -616,7 +1105,7 @@ record_detect(){
 
 # HTTP multi-URL download → downlink Mbit estimate
 detect_http(){
-  log "Method http: multi-URL download timing"
+  step "测速方法 http：多 URL 下载计时（会显示进度）"
 
   if ! have_bin curl && ! have_bin wget; then
     record_detect "http" "" "" "skipped: need curl or wget"
@@ -632,15 +1121,23 @@ detect_http(){
     log "  downloading sample: ${url}"
     mbit=""
     if have_bin curl; then
-      # -w writes metrics to stdout; body to tmp
       local meta
-      meta="$(curl -L --max-time 45 -o "${tmp}" -s -w '%{size_download} %{time_total}' "${url}" 2>/dev/null || true)"
+      # progress-bar → stderr；-w 指标 → stdout（只下一遍）
+      if [[ "${LIVE_OUTPUT}" == "1" ]]; then
+        meta="$(curl -L --max-time 45 -o "${tmp}" --progress-bar -w '%{size_download} %{time_total}' "${url}" || true)"
+      else
+        meta="$(curl -L --max-time 45 -o "${tmp}" -s -w '%{size_download} %{time_total}' "${url}" 2>/dev/null || true)"
+      fi
       bytes="$(printf '%s' "${meta}" | awk '{print $1}')"
       secs="$(printf '%s' "${meta}" | awk '{print $2}')"
     else
       local start end
       start="$(date +%s.%N 2>/dev/null || date +%s)"
-      wget -q -O "${tmp}" --timeout=45 "${url}" 2>/dev/null || true
+      if [[ "${LIVE_OUTPUT}" == "1" ]]; then
+        wget -O "${tmp}" --timeout=45 --progress=bar:force "${url}" || true
+      else
+        wget -q -O "${tmp}" --timeout=45 "${url}" 2>/dev/null || true
+      fi
       end="$(date +%s.%N 2>/dev/null || date +%s)"
       bytes="$(wc -c <"${tmp}" 2>/dev/null | tr -d ' ' || echo 0)"
       secs="$(awk -v s="${start}" -v e="${end}" 'BEGIN{d=e-s; if(d<=0) d=0.001; print d}')"
@@ -671,46 +1168,48 @@ detect_http(){
 
 # speedtest-cli or official ookla speedtest
 detect_speedtest(){
-  log "Method speedtest: local CLI if present"
+  step "测速方法 speedtest：本机 CLI（实时输出）"
 
-  local up="" down="" note=""
+  local up="" down="" note="" out
+  out="$(mktemp)"
 
   if have_bin speedtest; then
-    local out
-    # Ookla CLI JSON: download/upload.bandwidth are bytes/sec
-    if out="$(speedtest --accept-license --accept-gdpr -f json 2>/dev/null)"; then
+    log "  running: speedtest (live)..."
+    set +e
+    # Prefer human-readable live progress when LIVE_OUTPUT=1
+    if [[ "${LIVE_OUTPUT}" == "1" ]]; then
+      run_live "${out}" speedtest --accept-license --accept-gdpr --progress=yes
+      down="$(grep -iE 'Download' "${out}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)"
+      up="$(grep -iE 'Upload' "${out}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)"
+      down="$(rate_to_mbit "${down}")"
+      up="$(rate_to_mbit "${up}")"
+      note="speedtest live"
+    fi
+    if [[ -z "${down}" && -z "${up}" ]]; then
+      : >"${out}"
+      run_live "${out}" speedtest --accept-license --accept-gdpr -f json
       if have_bin python3; then
-        down="$(printf '%s' "${out}" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(int(d["download"]["bandwidth"]*8/1e6+0.5))' 2>/dev/null || true)"
-        up="$(printf '%s' "${out}" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(int(d["upload"]["bandwidth"]*8/1e6+0.5))' 2>/dev/null || true)"
-      else
-        down="$(printf '%s' "${out}" | tr '{' '\n' | grep -E '"bandwidth"' | head -1 | grep -oE '[0-9]+' | head -1)"
-        up="$(printf '%s' "${out}" | tr '{' '\n' | grep -E '"bandwidth"' | sed -n '2p' | grep -oE '[0-9]+' | head -1)"
-        [[ -n "${down}" ]] && down="$(awk -v b="${down}" 'BEGIN{printf "%d", int(b*8/1000000+0.5)}')"
-        [[ -n "${up}" ]] && up="$(awk -v b="${up}" 'BEGIN{printf "%d", int(b*8/1000000+0.5)}')"
+        down="$(python3 -c 'import sys,json; d=json.load(open(sys.argv[1])); print(int(d["download"]["bandwidth"]*8/1e6+0.5))' "${out}" 2>/dev/null || true)"
+        up="$(python3 -c 'import sys,json; d=json.load(open(sys.argv[1])); print(int(d["upload"]["bandwidth"]*8/1e6+0.5))' "${out}" 2>/dev/null || true)"
       fi
       note="ookla speedtest JSON"
     fi
-    if [[ -z "${down}" && -z "${up}" ]]; then
-      if out="$(speedtest --simple 2>/dev/null || speedtest 2>/dev/null)"; then
-        down="$(printf '%s' "${out}" | grep -iE 'Download' | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)"
-        up="$(printf '%s' "${out}" | grep -iE 'Upload' | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)"
-        down="$(rate_to_mbit "${down}")"
-        up="$(rate_to_mbit "${up}")"
-        note="speedtest text"
-      fi
-    fi
+    set -e
   fi
 
   if [[ -z "${down}" && -z "${up}" ]] && have_bin speedtest-cli; then
-    local out
-    if out="$(speedtest-cli --simple 2>/dev/null)"; then
-      down="$(printf '%s' "${out}" | grep -i Download | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)"
-      up="$(printf '%s' "${out}" | grep -i Upload | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)"
-      down="$(rate_to_mbit "${down}")"
-      up="$(rate_to_mbit "${up}")"
-      note="speedtest-cli"
-    fi
+    log "  running: speedtest-cli --simple (live)..."
+    set +e
+    run_live "${out}" speedtest-cli --simple
+    set -e
+    down="$(grep -i Download "${out}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)"
+    up="$(grep -i Upload "${out}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)"
+    down="$(rate_to_mbit "${down}")"
+    up="$(rate_to_mbit "${up}")"
+    note="speedtest-cli"
   fi
+
+  rm -f "${out}"
 
   if [[ -z "${down}" && -z "${up}" ]]; then
     record_detect "speedtest" "" "" "skipped: install speedtest or speedtest-cli"
@@ -720,7 +1219,7 @@ detect_speedtest(){
 }
 
 detect_iperf3(){
-  log "Method iperf3: point-to-point"
+  step "测速方法 iperf3：点对点（实时输出）"
 
   if ! have_bin iperf3; then
     record_detect "iperf3" "" "" "skipped: iperf3 not installed"
@@ -732,19 +1231,45 @@ detect_iperf3(){
   fi
 
   local dur="${IPERF3_DURATION:-8}"
-  local down_json up_json down="" up=""
+  local out down="" up=""
+  out="$(mktemp)"
 
-  log "  iperf3 download (-R) vs ${IPERF3_SERVER} (${dur}s)"
-  if down_json="$(iperf3 -c "${IPERF3_SERVER}" -t "${dur}" -J -R 2>/dev/null)"; then
-    down="$(printf '%s' "${down_json}" | grep -oE '"bits_per_second"[[:space:]]*:[[:space:]]*[0-9.]+' | tail -1 | grep -oE '[0-9.]+$')"
-    down="$(awk -v b="${down:-0}" 'BEGIN{printf "%d", int(b/1000000+0.5)}')"
+  step "iperf3 下行 (-R) → ${IPERF3_SERVER}（${dur}s）"
+  set +e
+  run_live "${out}" iperf3 -c "${IPERF3_SERVER}" -t "${dur}" -R
+  set -e
+  # receiver bits/sec from summary line
+  down="$(grep -iE 'receiver|sender' "${out}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | tail -2 | head -1 || true)"
+  # Mbits/sec line: prefer "Mbits/sec"
+  local down_line
+  down_line="$(grep -E 'bits/sec' "${out}" 2>/dev/null | grep -i receiver | tail -1 || true)"
+  if [[ -n "${down_line}" ]]; then
+    if echo "${down_line}" | grep -qiE 'Gbits'; then
+      down="$(echo "${down_line}" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)"
+      down="$(awk -v v="${down:-0}" 'BEGIN{printf "%d", int(v*1000+0.5)}')"
+    else
+      down="$(echo "${down_line}" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)"
+      down="$(awk -v v="${down:-0}" 'BEGIN{printf "%d", int(v+0.5)}')"
+    fi
   fi
 
-  log "  iperf3 upload vs ${IPERF3_SERVER} (${dur}s)"
-  if up_json="$(iperf3 -c "${IPERF3_SERVER}" -t "${dur}" -J 2>/dev/null)"; then
-    up="$(printf '%s' "${up_json}" | grep -oE '"bits_per_second"[[:space:]]*:[[:space:]]*[0-9.]+' | tail -1 | grep -oE '[0-9.]+$')"
-    up="$(awk -v b="${up:-0}" 'BEGIN{printf "%d", int(b/1000000+0.5)}')"
+  step "iperf3 上行 → ${IPERF3_SERVER}（${dur}s）"
+  : >"${out}"
+  set +e
+  run_live "${out}" iperf3 -c "${IPERF3_SERVER}" -t "${dur}"
+  set -e
+  local up_line
+  up_line="$(grep -E 'bits/sec' "${out}" 2>/dev/null | grep -i sender | tail -1 || true)"
+  if [[ -n "${up_line}" ]]; then
+    if echo "${up_line}" | grep -qiE 'Gbits'; then
+      up="$(echo "${up_line}" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)"
+      up="$(awk -v v="${up:-0}" 'BEGIN{printf "%d", int(v*1000+0.5)}')"
+    else
+      up="$(echo "${up_line}" | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)"
+      up="$(awk -v v="${up:-0}" 'BEGIN{printf "%d", int(v+0.5)}')"
+    fi
   fi
+  rm -f "${out}"
 
   if [[ -z "${up}" && -z "${down}" ]]; then
     record_detect "iperf3" "" "" "failed against ${IPERF3_SERVER}"
@@ -757,7 +1282,7 @@ detect_iperf3(){
 
 # Optional remote bench: download to temp, run, parse Mbps-like numbers
 detect_bench(){
-  log "Method bench: remote script (${BENCH_URL})"
+  step "测速方法 bench：远程脚本（全程实时输出，可能需数分钟）"
 
   if [[ "${ALLOW_REMOTE_BENCH}" != "1" ]]; then
     if is_tty; then
@@ -782,24 +1307,41 @@ detect_bench(){
     return 0
   fi
 
-  local work dir script out
+  local work script out
   work="$(mktemp -d)"
   script="${work}/bench.sh"
   out="${work}/out.txt"
 
-  log "  fetching bench script to ${script}"
+  log "  fetching bench script from ${BENCH_URL}"
+  log "  save to ${script}"
   if have_bin curl; then
-    curl -fsSL --max-time 60 "${BENCH_URL}" -o "${script}" || {
-      rm -rf "${work}"
-      record_detect "bench" "" "" "download failed"
-      return 0
-    }
+    if [[ "${LIVE_OUTPUT}" == "1" ]]; then
+      curl -fL --max-time 60 --progress-bar "${BENCH_URL}" -o "${script}" || {
+        rm -rf "${work}"
+        record_detect "bench" "" "" "download failed"
+        return 0
+      }
+    else
+      curl -fsSL --max-time 60 "${BENCH_URL}" -o "${script}" || {
+        rm -rf "${work}"
+        record_detect "bench" "" "" "download failed"
+        return 0
+      }
+    fi
   else
-    wget -q -O "${script}" --timeout=60 "${BENCH_URL}" || {
-      rm -rf "${work}"
-      record_detect "bench" "" "" "download failed"
-      return 0
-    }
+    if [[ "${LIVE_OUTPUT}" == "1" ]]; then
+      wget -O "${script}" --timeout=60 --progress=bar:force "${BENCH_URL}" || {
+        rm -rf "${work}"
+        record_detect "bench" "" "" "download failed"
+        return 0
+      }
+    else
+      wget -q -O "${script}" --timeout=60 "${BENCH_URL}" || {
+        rm -rf "${work}"
+        record_detect "bench" "" "" "download failed"
+        return 0
+      }
+    fi
   fi
 
   if [[ ! -s "${script}" ]]; then
@@ -809,10 +1351,14 @@ detect_bench(){
   fi
 
   chmod 0700 "${script}"
-  log "  running bench (may take several minutes, saturates link)..."
+  log "  开始执行 bench（输出会实时显示在下方，请勿中断）..."
+  log "  日志同时写入: ${out}"
+  echo "---------- bench live output begin ----------"
   set +e
-  bash "${script}" >"${out}" 2>&1
+  run_live "${out}" bash "${script}"
   set -e
+  echo "---------- bench live output end ----------"
+  log "  bench 进程结束，正在解析带宽数字..."
 
   # Parse common patterns: Download: xx.xx Mbps / 上行 / 下行 / Speed ...
   local down up
@@ -874,16 +1420,56 @@ run_all_detect_methods(){
 
   local methods="${DETECT_METHODS//,/ }"
   local m
+  local list=()
   for m in ${methods}; do
     m="$(printf '%s' "${m}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
-    case "${m}" in
-      http) detect_http ;;
-      speedtest|st) detect_speedtest ;;
-      iperf3|iperf) detect_iperf3 ;;
-      bench|benchsh) detect_bench ;;
-      "" ) ;;
-      *) warn "Unknown detect method: ${m}" ;;
-    esac
+    [[ -n "${m}" ]] || continue
+    list+=("${m}")
+  done
+
+  local rounds="${DETECT_ROUNDS:-1}"
+  [[ "${rounds}" -ge 1 ]] || rounds=1
+  [[ "${rounds}" -le 5 ]] || rounds=5
+
+  local total_steps=0
+  local r
+  for ((r=1; r<=rounds; r++)); do
+    for m in "${list[@]}"; do
+      # bench is slow: only first round
+      if [[ "${m}" == "bench" || "${m}" == "benchsh" ]] && [[ "${r}" -gt 1 ]]; then
+        continue
+      fi
+      total_steps=$((total_steps + 1))
+    done
+  done
+
+  local idx=0
+  log "测速计划: methods=${list[*]}  rounds=${rounds} (bench 仅第1轮)  LIVE_OUTPUT=${LIVE_OUTPUT}"
+  log "聚合模式 AGGREGATE_MODE=${AGGREGATE_MODE}  安全系数=${BANDWIDTH_SAFETY_FACTOR}"
+
+  for ((r=1; r<=rounds; r++)); do
+    step "测速轮次 ${r}/${rounds}"
+    for m in "${list[@]}"; do
+      if [[ "${m}" == "bench" || "${m}" == "benchsh" ]] && [[ "${r}" -gt 1 ]]; then
+        log "跳过 bench 第 ${r} 轮（过慢，仅第1轮）"
+        continue
+      fi
+      idx=$((idx + 1))
+      progress_set "${idx}" "${total_steps}" "测速 ${m} (轮${r}/${rounds})" "method=${m} round=${r}"
+      case "${m}" in
+        http) detect_http ;;
+        speedtest|st) detect_speedtest ;;
+        iperf3|iperf) detect_iperf3 ;;
+        bench|benchsh) detect_bench ;;
+        *) warn "Unknown detect method: ${m}" ;;
+      esac
+      # tag round in last note for clarity
+      if [[ ${#DETECT_NOTES[@]} -gt 0 ]]; then
+        local li=$((${#DETECT_NOTES[@]} - 1))
+        DETECT_NOTES[li]="${DETECT_NOTES[li]} r${r}"
+      fi
+      ok "完成 ${idx}/${total_steps}: ${m} 轮${r}"
+    done
   done
 }
 
@@ -892,25 +1478,50 @@ aggregate_peaks(){
   PEAK_DOWN_MBIT=""
   local i n="${#DETECT_METHOD_NAMES[@]}"
   local up down
-  local max_up=0 max_down=0 has_up=0 has_down=0
+  local -a ups=() downs=()
+  local max_up=0 max_down=0 min_up="" min_down=""
 
   for ((i=0; i<n; i++)); do
     up="${DETECT_UP_MBITS[i]:-}"
     down="${DETECT_DOWN_MBITS[i]:-}"
-    if [[ -n "${up}" && "${up}" -gt 0 ]]; then
-      has_up=1
+    if [[ -n "${up}" && "${up}" =~ ^[0-9]+$ && "${up}" -gt 0 ]]; then
+      ups+=("${up}")
       max_up="$(max_int "${max_up}" "${up}")"
+      if [[ -z "${min_up}" ]]; then min_up="${up}"; else min_up="$(min_int "${min_up}" "${up}")"; fi
     fi
-    if [[ -n "${down}" && "${down}" -gt 0 ]]; then
-      has_down=1
+    if [[ -n "${down}" && "${down}" =~ ^[0-9]+$ && "${down}" -gt 0 ]]; then
+      downs+=("${down}")
       max_down="$(max_int "${max_down}" "${down}")"
+      if [[ -z "${min_down}" ]]; then min_down="${down}"; else min_down="$(min_int "${min_down}" "${down}")"; fi
     fi
   done
 
-  [[ "${has_up}" -eq 1 ]] && PEAK_UP_MBIT="${max_up}"
-  [[ "${has_down}" -eq 1 ]] && PEAK_DOWN_MBIT="${max_down}"
+  local mode="${AGGREGATE_MODE:-median}"
+  case "${mode}" in
+    max|peak)
+      [[ "${#ups[@]}" -gt 0 ]] && PEAK_UP_MBIT="${max_up}"
+      [[ "${#downs[@]}" -gt 0 ]] && PEAK_DOWN_MBIT="${max_down}"
+      ;;
+    min|conservative)
+      [[ -n "${min_up}" ]] && PEAK_UP_MBIT="${min_up}"
+      [[ -n "${min_down}" ]] && PEAK_DOWN_MBIT="${min_down}"
+      ;;
+    median|*)
+      PEAK_UP_MBIT="$(median_int "${ups[@]}")"
+      PEAK_DOWN_MBIT="$(median_int "${downs[@]}")"
+      ;;
+  esac
 
-  # If only one direction measured, do not invent the other
+  log "聚合[${mode}] 原始 up=${PEAK_UP_MBIT:-n/a} down=${PEAK_DOWN_MBIT:-n/a} (样本 up=${#ups[@]} down=${#downs[@]})"
+
+  # Cap measured peak before applying safety (防止 10G 虚高)
+  if [[ -n "${PEAK_UP_MBIT}" ]]; then
+    PEAK_UP_MBIT="$(cap_mbit "${PEAK_UP_MBIT}" up)"
+  fi
+  if [[ -n "${PEAK_DOWN_MBIT}" ]]; then
+    PEAK_DOWN_MBIT="$(cap_mbit "${PEAK_DOWN_MBIT}" down)"
+  fi
+
   SUGGEST_UP=""
   SUGGEST_DOWN=""
   [[ -n "${PEAK_UP_MBIT}" ]] && SUGGEST_UP="$(mbit_with_safety "${PEAK_UP_MBIT}")"
@@ -920,23 +1531,25 @@ aggregate_peaks(){
 print_detect_table(){
   echo
   echo "====== detect summary ======"
-  printf '%-12s  %-12s  %-12s  %s\n' "METHOD" "UP (Mbit)" "DOWN (Mbit)" "NOTE"
-  printf '%-12s  %-12s  %-12s  %s\n' "------------" "------------" "------------" "----"
+  printf '%-14s  %-12s  %-12s  %s\n' "METHOD" "UP (Mbit)" "DOWN (Mbit)" "NOTE"
+  printf '%-14s  %-12s  %-12s  %s\n' "--------------" "------------" "------------" "----"
   local i n="${#DETECT_METHOD_NAMES[@]}"
   for ((i=0; i<n; i++)); do
-    printf '%-12s  %-12s  %-12s  %s\n' \
+    printf '%-14s  %-12s  %-12s  %s\n' \
       "${DETECT_METHOD_NAMES[i]}" \
       "${DETECT_UP_MBITS[i]:-n/a}" \
       "${DETECT_DOWN_MBITS[i]:-n/a}" \
       "${DETECT_NOTES[i]:-}"
   done
   echo
-  echo "Peak up:   ${PEAK_UP_MBIT:-n/a} Mbit"
-  echo "Peak down: ${PEAK_DOWN_MBIT:-n/a} Mbit"
-  echo "Safety:    × ${BANDWIDTH_SAFETY_FACTOR}"
-  echo "Suggest:   UP_RATE=${SUGGEST_UP:-unset}  DOWN_RATE=${SUGGEST_DOWN:-unset}"
+  echo "Aggregate:  ${AGGREGATE_MODE}  (not raw max unless mode=max)"
+  echo "Peak up:    ${PEAK_UP_MBIT:-n/a} Mbit (after caps)"
+  echo "Peak down:  ${PEAK_DOWN_MBIT:-n/a} Mbit (after caps)"
+  echo "Safety:     × ${BANDWIDTH_SAFETY_FACTOR}"
+  echo "MAX_UP:     ${MAX_UP_RATE:-cpu-soft/${CPU_CAP_RATES}}  MAX_DOWN: ${MAX_DOWN_RATE:-cpu-soft/${CPU_CAP_RATES}}"
+  echo "Suggest:    UP_RATE=${SUGGEST_UP:-unset}  DOWN_RATE=${SUGGEST_DOWN:-unset}"
   echo
-  echo "Note: peaks are path/time-dependent estimates, not ISP contract rates."
+  echo "Note: 测速=路径/时段估计，≠合同带宽；CAKE 必须低于真实瓶颈。"
 }
 
 save_detect_cache(){
@@ -1122,32 +1735,34 @@ EOF
   fi
 }
 
-# Optional: auto-tune CAKE_RTT from ping if user did not override
-maybe_auto_rtt(){
-  [[ -z "${OVERRIDE_CAKE_RTT}" ]] || return 0
-  local rtt_s
-  rtt_s="$(suggest_rtt_from_ping 1.1.1.1 || true)"
-  if [[ -n "${rtt_s}" ]]; then
-    CAKE_RTT="${rtt_s}"
-    log "Auto CAKE_RTT from ping hint: ${CAKE_RTT}"
-  fi
-}
+# Back-compat alias
+maybe_auto_rtt(){ resolve_cake_rtt; }
 
 run_detect_pipeline(){
+  local retain_on_fail="${1:-0}"  # 1=retune: keep previous rates if all methods fail
+
   echo "====== auto bandwidth detect v${VERSION} ======"
   echo "Methods: ${DETECT_METHODS}"
-  echo "Safety factor: ${BANDWIDTH_SAFETY_FACTOR}"
-  echo "Non-interactive: peaks × factor will be filled automatically."
+  echo "Rounds: ${DETECT_ROUNDS}  Aggregate: ${AGGREGATE_MODE}"
+  echo "Safety factor: ${BANDWIDTH_SAFETY_FACTOR}  (生产默认 0.85)"
+  echo "Live output: LIVE_OUTPUT=${LIVE_OUTPUT}"
+  echo "Non-interactive: 中位/聚合值 × factor → CAKE bandwidth"
   echo "This will saturate the link for a while."
   echo
 
   run_all_detect_methods
+
+  step "汇总样本（${AGGREGATE_MODE}）→ 上限保护 → ×${BANDWIDTH_SAFETY_FACTOR}"
   aggregate_peaks
   print_detect_table
-  maybe_auto_rtt
+  resolve_cake_rtt
 
   if [[ -z "${PEAK_UP_MBIT:-}" && -z "${PEAK_DOWN_MBIT:-}" ]]; then
     warn "All detect methods failed or were skipped."
+    if [[ "${retain_on_fail}" == "1" ]]; then
+      warn "保留已有限速配置，不覆盖（retune 失败保护）"
+      return 1
+    fi
     warn "Will apply BBR+CAKE without hard bandwidth limits."
     ENABLE_LIMITS=0
     BANDWIDTH_SOURCE="none"
@@ -1157,7 +1772,6 @@ run_detect_pipeline(){
   fi
 
   # If only one direction measured, mirror the other for shaping usability on 中转
-  # (better than leaving empty; user can override with UP_RATE/DOWN_RATE)
   if [[ -n "${PEAK_DOWN_MBIT:-}" && -z "${PEAK_UP_MBIT:-}" ]]; then
     PEAK_UP_MBIT="${PEAK_DOWN_MBIT}"
     log "Only down measured → mirror peak up=${PEAK_UP_MBIT} Mbit for CAKE egress"
@@ -1166,18 +1780,22 @@ run_detect_pipeline(){
     PEAK_DOWN_MBIT="${PEAK_UP_MBIT}"
     log "Only up measured → mirror peak down=${PEAK_DOWN_MBIT} Mbit for CAKE ingress"
   fi
+  # recompute suggest after mirror (cap already applied on peaks)
   SUGGEST_UP="$(mbit_with_safety "${PEAK_UP_MBIT}")"
   SUGGEST_DOWN="$(mbit_with_safety "${PEAK_DOWN_MBIT}")"
   echo "Final suggest after mirror: UP=${SUGGEST_UP} DOWN=${SUGGEST_DOWN}"
 
   save_detect_cache
   accept_suggest_rates
+  ok "带宽已自动填入: UP=${BANDWIDTH_UP_DEFAULT:-none} DOWN=${BANDWIDTH_DOWN_DEFAULT:-none}"
+  return 0
 }
 
 persist_install(){
   install_self
   write_env_file
   write_service_file
+  write_retune_units
 
   if have_bin systemctl; then
     systemctl daemon-reload
@@ -1185,20 +1803,32 @@ persist_install(){
     # apply already done; just enable for reboot — restart would re-apply
     systemctl restart "${SERVICE_NAME}" || true
     ok "Installed and enabled ${SERVICE_NAME}."
+    if [[ "${DAILY_RETEST}" == "1" ]]; then
+      systemctl enable --now "${RETUNE_TIMER_NAME}" >/dev/null 2>&1 || \
+        systemctl enable "${RETUNE_TIMER_NAME}" >/dev/null 2>&1 || true
+      systemctl start "${RETUNE_TIMER_NAME}" 2>/dev/null || true
+      ok "Daily retune timer enabled (北京时间 ${RETEST_HOUR}:$(printf '%02d' "${RETEST_MINUTE}") Asia/Shanghai)"
+      systemctl list-timers "${RETUNE_TIMER_NAME}" --no-pager 2>/dev/null || true
+    else
+      systemctl disable --now "${RETUNE_TIMER_NAME}" 2>/dev/null || true
+      log "DAILY_RETEST=0 → 未启用每日重测"
+    fi
   else
     warn "systemctl not found; files written but service not enabled."
   fi
   echo "[CONFIG] ${ENV_FILE}"
   echo "[SCRIPT] ${INSTALL_PATH}"
   echo "[SERVICE] ${SERVICE_FILE}"
+  echo "[TIMER] ${RETUNE_TIMER_FILE} (DAILY_RETEST=${DAILY_RETEST})"
   echo "[BW] source=${BANDWIDTH_SOURCE} UP=${BANDWIDTH_UP_DEFAULT:-none} DOWN=${BANDWIDTH_DOWN_DEFAULT:-none} limits=${ENABLE_LIMITS}"
+  echo "[LOG] ${RETUNE_LOG_FILE}"
+  echo "[PROGRESS] ${PROGRESS_FILE}"
 }
 
 # One-shot: detect → auto-fill → apply → install (default entry)
 auto_cmd(){
   require_root
   load_overrides
-  preflight
 
   # Fully automatic: no prompts
   AUTO_CONFIRM_PEAK=1
@@ -1208,10 +1838,25 @@ auto_cmd(){
   fi
 
   echo "=============================================="
-  echo " BBR+CAKE 中转一键调优 v${VERSION}"
-  echo " 测速 → 自动填带宽 → 应用 → 持久化"
+  echo " BBR+CAKE 中转一键调优 v${VERSION} (Transit + Region)"
+  echo " 测速×${DETECT_ROUNDS}轮/${AGGREGATE_MODE} → ×safety → 应用 → 持久化"
+  echo " 地区 REGION=${REGION} GEO_DETECT=${GEO_DETECT} | LIVE_OUTPUT=${LIVE_OUTPUT}"
+  echo " 每日重测 DAILY_RETEST=${DAILY_RETEST} (北京 ${RETEST_HOUR}:$(printf '%02d' "${RETEST_MINUTE:-0}"))"
   echo "=============================================="
   echo
+  echo "总流程预告:"
+  echo "  阶段 1/5  环境检查"
+  echo "  阶段 2/5  多轮测速 → ${AGGREGATE_MODE} → ×${BANDWIDTH_SAFETY_FACTOR} + 上限"
+  echo "  阶段 3/5  CPU/RTT 策略"
+  echo "  阶段 4/5  应用 BBR + CAKE"
+  echo "  阶段 5/5  安装 systemd + 北京时间每日重测"
+  echo "进度文件: ${PROGRESS_FILE}"
+  echo
+
+  progress_set 1 5 "环境检查 + 地区识别"
+  preflight
+  resolve_region_tuning
+  ok "环境检查通过 profile=${REGION_PROFILE:-?} RTT=${CAKE_RTT} safety=${BANDWIDTH_SAFETY_FACTOR}"
 
   local has_cli_rates=0
   if [[ -n "${OVERRIDE_UP_RATE:-}" || -n "${OVERRIDE_DOWN_RATE:-}" || \
@@ -1219,6 +1864,7 @@ auto_cmd(){
     has_cli_rates=1
   fi
 
+  progress_set 2 5 "多轮测速并自动填带宽" "factor=${BANDWIDTH_SAFETY_FACTOR} mode=${AGGREGATE_MODE}"
   if [[ "${SKIP_DETECT}" == "1" || "${has_cli_rates}" -eq 1 ]]; then
     if [[ "${has_cli_rates}" -eq 1 ]]; then
       BANDWIDTH_UP_DEFAULT="${OVERRIDE_UP_RATE:-${OVERRIDE_BANDWIDTH_UP_DEFAULT:-${BANDWIDTH_UP_DEFAULT:-}}}"
@@ -1227,17 +1873,22 @@ auto_cmd(){
       BANDWIDTH_SOURCE="manual"
       log "Skip detect: using manual rates UP=${BANDWIDTH_UP_DEFAULT:-unset} DOWN=${BANDWIDTH_DOWN_DEFAULT:-unset}"
     else
-      # SKIP_DETECT without rates: use env file / cache
       resolve_bandwidth
     fi
   else
-    # Always fresh detect on auto (ignore old config rates so re-run retunes)
     BANDWIDTH_UP_DEFAULT=""
     BANDWIDTH_DOWN_DEFAULT=""
-    run_detect_pipeline
+    run_detect_pipeline 0 || true
   fi
+  ok "阶段 2/5 完成"
 
-  log "Applying BBR + CAKE ..."
+  progress_set 3 5 "CPU / RTT 自适应"
+  resolve_cake_rtt
+  maybe_adjust_ingress_for_cpu
+  ok "阶段 3/5 完成 CAKE_RTT=${CAKE_RTT} ingress=${ENABLE_INGRESS_SHAPING}"
+
+  progress_set 4 5 "应用 BBR + CAKE"
+  step "写入 sysctl / 发现网卡 / 配置 qdisc / MSS"
   write_sysctl
   detect_cake_nat
   discover_candidates
@@ -1246,19 +1897,77 @@ auto_cmd(){
   show_qdisc_status
   echo
   ok "Applied (source=${BANDWIDTH_SOURCE}, limits=${ENABLE_LIMITS}, UP=${BANDWIDTH_UP_DEFAULT:-none}, DOWN=${BANDWIDTH_DOWN_DEFAULT:-none})."
+  ok "阶段 4/5 完成"
 
+  progress_set 5 5 "安装 systemd + 每日重测定时器"
   if [[ "${AUTO_INSTALL}" == "1" ]]; then
-    log "Persisting via install ..."
+    step "写入单元、enable、retune timer"
     persist_install
   else
     warn "AUTO_INSTALL=0 → not writing systemd unit. Reboot will lose tc rules."
     echo "[NOTE] Run: $0 install   later if needed."
   fi
+  ok "阶段 5/5 完成"
 
+  progress_done 5 "一键调优完成"
   echo
-  ok "一键调优完成。"
-  echo "查看: $0 status"
-  echo "卸载: $0 uninstall"
+  echo "══════════════════════════════════════════════"
+  ok "一键调优全部完成 (v${VERSION})"
+  echo "══════════════════════════════════════════════"
+  echo "查看状态: $0 status"
+  echo "看进度:   cat ${PROGRESS_FILE}"
+  echo "手动重测: $0 retune"
+  echo "卸载:     $0 uninstall"
+}
+
+# Nightly / manual re-detect and re-apply (keeps previous rates if detect fails)
+retune_cmd(){
+  require_root
+  load_overrides
+  AUTO_CONFIRM_PEAK=1
+  if [[ -z "${OVERRIDE_ALLOW_REMOTE_BENCH}" ]]; then
+    # retune: allow bench only if already enabled in env
+    :
+  fi
+
+  mkdir -p "${RETUNE_LOG_DIR}" "$(dirname "${PROGRESS_FILE}")"
+  local ts
+  ts="$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S CST' 2>/dev/null || date)"
+
+  {
+    echo
+    echo "########## retune start ${ts} v${VERSION} ##########"
+    progress_set 1 4 "每日重测-环境检查" "beijing=${ts}"
+    preflight
+
+    progress_set 2 4 "每日重测-测速填带宽" "rounds=${DETECT_ROUNDS}"
+    # Keep existing rates in memory as fallback
+    local prev_up="${BANDWIDTH_UP_DEFAULT:-}" prev_down="${BANDWIDTH_DOWN_DEFAULT:-}" prev_lim="${ENABLE_LIMITS:-}"
+    BANDWIDTH_UP_DEFAULT=""
+    BANDWIDTH_DOWN_DEFAULT=""
+    if ! run_detect_pipeline 1; then
+      BANDWIDTH_UP_DEFAULT="${prev_up}"
+      BANDWIDTH_DOWN_DEFAULT="${prev_down}"
+      ENABLE_LIMITS="${prev_lim:-1}"
+      BANDWIDTH_SOURCE="retain"
+      warn "测速失败，保留: UP=${BANDWIDTH_UP_DEFAULT:-none} DOWN=${BANDWIDTH_DOWN_DEFAULT:-none}"
+    fi
+
+    progress_set 3 4 "每日重测-CPU/RTT/应用"
+    resolve_cake_rtt
+    maybe_adjust_ingress_for_cpu
+    write_sysctl
+    detect_cake_nat
+    discover_candidates
+    apply_qdisc
+    apply_mss
+    write_env_file
+
+    progress_set 4 4 "每日重测-完成"
+    show_qdisc_status
+    ok "retune done UP=${BANDWIDTH_UP_DEFAULT:-none} DOWN=${BANDWIDTH_DOWN_DEFAULT:-none} rtt=${CAKE_RTT} ingress=${ENABLE_INGRESS_SHAPING}"
+    echo "########## retune end $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date) ##########"
+  } 2>&1 | tee -a "${RETUNE_LOG_FILE}"
 }
 
 detect_cmd(){
@@ -1268,7 +1977,7 @@ detect_cmd(){
   fi
 
   echo "====== bandwidth detect v${VERSION} ======"
-  echo "Methods: ${DETECT_METHODS}"
+  echo "Methods: ${DETECT_METHODS}  rounds=${DETECT_ROUNDS}  mode=${AGGREGATE_MODE}"
   echo "Safety factor: ${BANDWIDTH_SAFETY_FACTOR}"
   echo "This will saturate the link for a while. Prefer off-peak on production nodes."
   echo
@@ -1282,16 +1991,11 @@ detect_cmd(){
     esac
   fi
 
-  # interactive detect: do not force bench unless allowed
   run_all_detect_methods
   aggregate_peaks
   print_detect_table
-
-  local rtt_s
-  rtt_s="$(suggest_rtt_from_ping 1.1.1.1 || true)"
-  if [[ -n "${rtt_s}" ]]; then
-    log "Optional CAKE_RTT hint from ping: ${rtt_s} (current ${CAKE_RTT})"
-  fi
+  resolve_cake_rtt
+  log "CAKE_RTT=${CAKE_RTT}"
 
   if [[ -z "${PEAK_UP_MBIT:-}" && -z "${PEAK_DOWN_MBIT:-}" ]]; then
     warn "All methods failed or were skipped. Install speedtest-cli / set IPERF3_SERVER / fix HTTP URLs."
@@ -1333,6 +2037,8 @@ apply_cmd(){
   load_overrides
   preflight
   resolve_bandwidth
+  resolve_cake_rtt
+  maybe_adjust_ingress_for_cpu
   write_sysctl
   detect_cake_nat
   discover_candidates
@@ -1342,7 +2048,7 @@ apply_cmd(){
   echo
   ok "Applied BBR + CAKE profile (source=${BANDWIDTH_SOURCE}, limits=${ENABLE_LIMITS})."
   echo "[NOTE] Use '$0 install' to make tc qdisc and MSS rules persistent across reboot."
-  echo "[NOTE] Or one-shot retune: $0 auto"
+  echo "[NOTE] Or one-shot: $0 auto | nightly: $0 retune"
 }
 
 write_env_file(){
@@ -1376,6 +2082,23 @@ HTTP_TEST_URLS="${HTTP_TEST_URLS}"
 PROFILE="${PROFILE}"
 USE_DETECT_CACHE="${USE_DETECT_CACHE}"
 SCRIPT_URL="${SCRIPT_URL}"
+MAX_RATE="${MAX_RATE}"
+MAX_UP_RATE="${MAX_UP_RATE}"
+MAX_DOWN_RATE="${MAX_DOWN_RATE}"
+DETECT_ROUNDS="${DETECT_ROUNDS}"
+AGGREGATE_MODE="${AGGREGATE_MODE}"
+DAILY_RETEST="${DAILY_RETEST}"
+RETEST_HOUR="${RETEST_HOUR}"
+RETEST_MINUTE="${RETEST_MINUTE}"
+CPU_INGRESS_OFF_LOAD="${CPU_INGRESS_OFF_LOAD}"
+CPU_INGRESS_ON_LOAD="${CPU_INGRESS_ON_LOAD}"
+REGION="${REGION}"
+GEO_DETECT="${GEO_DETECT}"
+CPU_CAP_RATES="${CPU_CAP_RATES}"
+LIVE_OUTPUT="${LIVE_OUTPUT}"
+DETECTED_REGION="${DETECTED_REGION}"
+DETECTED_COUNTRY="${DETECTED_COUNTRY}"
+REGION_PROFILE="${REGION_PROFILE}"
 EOF
 }
 
@@ -1420,24 +2143,75 @@ WantedBy=multi-user.target
 EOF
 }
 
+# Daily re-detect at Beijing time (Asia/Shanghai)
+write_retune_units(){
+  need_bin systemctl
+  local hh mm
+  hh="$(printf '%02d' "${RETEST_HOUR:-3}")"
+  mm="$(printf '%02d' "${RETEST_MINUTE:-0}")"
+
+  cat >"${RETUNE_SERVICE_FILE}" <<EOF
+[Unit]
+Description=BBR+CAKE transit daily bandwidth retune (detect+apply)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=-${ENV_FILE}
+# Quiet console; full log still under ${RETUNE_LOG_FILE}
+Environment=LIVE_OUTPUT=0
+Environment=AUTO_CONFIRM_PEAK=1
+ExecStart=${INSTALL_PATH} retune
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+EOF
+
+  cat >"${RETUNE_TIMER_FILE}" <<EOF
+[Unit]
+Description=Daily BBR+CAKE retune at Beijing time ${hh}:${mm}
+
+[Timer]
+# systemd Timezone= requires reasonably new systemd
+OnCalendar=*-*-* ${hh}:${mm}:00
+Timezone=Asia/Shanghai
+Persistent=true
+Unit=${RETUNE_SERVICE_NAME}
+
+[Install]
+WantedBy=timers.target
+EOF
+}
+
 install_cmd(){
   require_root
   load_overrides
   preflight
   resolve_bandwidth
+  resolve_cake_rtt
+  maybe_adjust_ingress_for_cpu
   install_self
   write_env_file
   write_service_file
+  write_retune_units
 
   systemctl daemon-reload
   systemctl enable "${SERVICE_NAME}" >/dev/null
   systemctl restart "${SERVICE_NAME}"
 
+  if [[ "${DAILY_RETEST}" == "1" ]]; then
+    systemctl enable --now "${RETUNE_TIMER_NAME}" >/dev/null 2>&1 || true
+    systemctl start "${RETUNE_TIMER_NAME}" 2>/dev/null || true
+  fi
+
   ok "Installed and enabled ${SERVICE_NAME}."
   echo "[CONFIG] ${ENV_FILE}"
   echo "[SCRIPT] ${INSTALL_PATH}"
   echo "[SERVICE] ${SERVICE_FILE}"
+  echo "[TIMER] ${RETUNE_TIMER_FILE} DAILY_RETEST=${DAILY_RETEST} Beijing ${RETEST_HOUR}:$(printf '%02d' "${RETEST_MINUTE}")"
   echo "[BW] source=${BANDWIDTH_SOURCE} UP=${BANDWIDTH_UP_DEFAULT:-none} DOWN=${BANDWIDTH_DOWN_DEFAULT:-none} limits=${ENABLE_LIMITS}"
+  systemctl list-timers "${RETUNE_TIMER_NAME}" --no-pager 2>/dev/null || true
 }
 
 cleanup_runtime(){
@@ -1463,15 +2237,19 @@ cleanup_runtime(){
 uninstall_cmd(){
   require_root
 
-  if have_bin systemctl && [[ -f "${SERVICE_FILE}" ]]; then
+  if have_bin systemctl; then
+    systemctl stop "${RETUNE_TIMER_NAME}" 2>/dev/null || true
+    systemctl disable "${RETUNE_TIMER_NAME}" >/dev/null 2>&1 || true
+    systemctl stop "${RETUNE_SERVICE_NAME}" 2>/dev/null || true
     systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
     systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
   else
     cleanup_runtime || true
   fi
 
-  rm -f "${SERVICE_FILE}" "${ENV_FILE}" "${SYSCTL_FILE}" "${INSTALL_PATH}"
-  rm -f "${DETECT_CACHE_FILE}"
+  rm -f "${SERVICE_FILE}" "${RETUNE_SERVICE_FILE}" "${RETUNE_TIMER_FILE}"
+  rm -f "${ENV_FILE}" "${SYSCTL_FILE}" "${INSTALL_PATH}"
+  rm -f "${DETECT_CACHE_FILE}" "${PROGRESS_FILE}"
   rmdir "$(dirname "${DETECT_CACHE_FILE}")" 2>/dev/null || true
 
   if have_bin systemctl; then
@@ -1479,12 +2257,32 @@ uninstall_cmd(){
   fi
 
   sysctl --system >/dev/null 2>&1 || true
-  ok "Uninstalled BBR + CAKE tuning files."
+  ok "Uninstalled BBR + CAKE tuning files (incl. daily retune timer)."
 }
 
 status_cmd(){
   echo "====== version ======"
-  echo "v${VERSION}"
+  echo "v${VERSION}  (transit production + region profiles)"
+  echo "Beijing now: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || date)"
+
+  echo
+  echo "====== region / geo ======"
+  echo "REGION=${REGION}  GEO_DETECT=${GEO_DETECT}"
+  echo "profile=${REGION_PROFILE:-?}  detected_region=${DETECTED_REGION:-?}"
+  echo "country=${DETECTED_COUNTRY:-?}  geo=${DETECTED_GEO:-?}"
+  echo "CAKE_RTT=${CAKE_RTT}  safety=${BANDWIDTH_SAFETY_FACTOR}"
+  echo "note=${REGION_NOTE:-}"
+  if [[ -f "${ENV_FILE}" ]]; then
+    grep -E '^(REGION|GEO_DETECT|DETECTED_|REGION_PROFILE|CAKE_RTT|BANDWIDTH_SAFETY)=' "${ENV_FILE}" 2>/dev/null || true
+  fi
+
+  echo
+  echo "====== progress (可视化当前步骤) ======"
+  if [[ -f "${PROGRESS_FILE}" ]]; then
+    cat "${PROGRESS_FILE}"
+  else
+    echo "No ${PROGRESS_FILE} (run auto/retune first)"
+  fi
 
   echo
   echo "====== sysctl ======"
@@ -1497,7 +2295,7 @@ status_cmd(){
   echo
   echo "====== bandwidth config ======"
   if [[ -f "${ENV_FILE}" ]]; then
-    grep -E '^(ENABLE_LIMITS|UP_RATE|DOWN_RATE|BANDWIDTH_SOURCE|CAKE_RTT|PROFILE)=' "${ENV_FILE}" 2>/dev/null || true
+    grep -E '^(ENABLE_LIMITS|UP_RATE|DOWN_RATE|BANDWIDTH_SOURCE|CAKE_RTT|PROFILE|BANDWIDTH_SAFETY_FACTOR|AGGREGATE_MODE|DETECT_ROUNDS|MAX_|DAILY_|RETEST_|REGION|CPU_)=' "${ENV_FILE}" 2>/dev/null || true
   else
     echo "No ${ENV_FILE}"
   fi
@@ -1509,19 +2307,34 @@ status_cmd(){
   fi
 
   echo
-  echo "====== service ======"
+  echo "====== service / timer ======"
   if have_bin systemctl; then
     systemctl is-enabled "${SERVICE_NAME}" 2>/dev/null || true
     systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true
+    echo "--- retune timer ---"
+    systemctl is-enabled "${RETUNE_TIMER_NAME}" 2>/dev/null || true
+    systemctl list-timers "${RETUNE_TIMER_NAME}" --no-pager 2>/dev/null || true
   else
     echo "systemctl not available"
   fi
+
+  echo
+  echo "====== CPU snapshot ======"
+  echo "cores=$(cpu_nproc) load_pct≈$(cpu_load_pct)% soft_max_mbit=$(cpu_soft_max_mbit)"
 
   load_overrides
   if have_bin ip && have_bin tc; then
     if discover_candidates 2>/dev/null; then
       show_qdisc_status
     fi
+  fi
+
+  echo
+  echo "====== retune log (tail) ======"
+  if [[ -f "${RETUNE_LOG_FILE}" ]]; then
+    tail -n 30 "${RETUNE_LOG_FILE}" 2>/dev/null || true
+  else
+    echo "No ${RETUNE_LOG_FILE} yet"
   fi
 
   echo
@@ -1544,6 +2357,9 @@ main(){
       ;;
     detect)
       detect_cmd
+      ;;
+    retune|daily-retune|redetect)
+      retune_cmd
       ;;
     apply)
       apply_cmd
