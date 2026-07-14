@@ -1,4 +1,4 @@
-# BBR + CAKE 中转服务器一键调优 v3.3.1
+# BBR + CAKE 中转服务器一键调优 v3.3.2
 
 面向 **Linux 中转 / 出口 / 共享节点** 的生产向网络调优脚本。  
 **推荐环境：Debian / Ubuntu**（其它带 systemd + iproute2 的 Linux 一般也可用）。
