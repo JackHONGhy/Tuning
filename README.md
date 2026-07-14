@@ -1,4 +1,4 @@
-# BBR + CAKE 中转服务器一键调优 v3.4.0
+# BBR + CAKE 中转服务器一键调优 v3.4.1
 
 面向 **Linux 中转 / 出口 / 共享节点** 的生产向网络调优脚本。  
 **推荐环境：Debian / Ubuntu**（其它带 systemd + iproute2 的 Linux 一般也可用）。
@@ -47,7 +47,7 @@ wget -qO- https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning | sudo
 | 安全折扣 | 约 ×0.85（美/远路径更保守） |
 | 速率校验 | 规范化 `100`/`100M`/`100Mbit`，非法限速不写入 tc |
 | 地区差异化 | `asia` / `eu` / `us` / `far` |
-| 位置识别 | `REGION=auto` 地理 API，失败则 ping RTT |
+| 位置识别 | **云元数据 > Cloudflare 节点 > 多 IP 库投票**（避免单库把美区标成香港） |
 | 上限 / CPU | `MAX_RATE`、核数软上限、高负载关 ingress |
 | 可视化 | 阶段横幅 + 实时输出 + 进度文件 |
 | 每日重测 | 北京时间 03:00；失败保留旧限速 |
@@ -71,7 +71,8 @@ wget -qO- https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning | sudo
 wget -qO- https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning | sudo GEO_DETECT=0 bash
 ```
 
-> 识别的是 **服务器出口 IP 位置**，不是用户位置。美机服务亚洲用户请用 `REGION=us` 或手写 `CAKE_RTT`。
+> 自动识别优先级：云厂商元数据（腾讯/AWS/GCP/Azure）→ Cloudflare 邻近 colo → 多 IP 库投票。  
+> **不要只信 ipapi「香港」**——美区 IP 被误标很常见。仍不准时强制：`REGION=us`。
 
 ---
 
