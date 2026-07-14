@@ -1,4 +1,4 @@
-# BBR + CAKE 中转服务器一键调优 v3.3.3
+# BBR + CAKE 中转服务器一键调优 v3.4.0
 
 面向 **Linux 中转 / 出口 / 共享节点** 的生产向网络调优脚本。  
 **推荐环境：Debian / Ubuntu**（其它带 systemd + iproute2 的 Linux 一般也可用）。
@@ -41,7 +41,9 @@ wget -qO- https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning | sudo
 | BBR + CAKE | 拥塞控制 + AQM/整形 |
 | 多轮测速 | 默认 2 轮；样本够则提前结束 |
 | 中位聚合 | `AGGREGATE_MODE=median` |
-| 默认测速 | http + speedtest + iperf3；**bench 仅样本不足时 fallback** |
+| 默认测速 | **http + speedtest（自动装 CLI）+ bench**；已移除默认 iperf3 |
+| speedtest | `apt/pip` 自动安装 `speedtest-cli` 后测上下行 |
+| bench | 下载 `bench.sh` 再执行（**不用** `wget\|bash` 裸管道，更安全） |
 | 安全折扣 | 约 ×0.85（美/远路径更保守） |
 | 速率校验 | 规范化 `100`/`100M`/`100Mbit`，非法限速不写入 tc |
 | 地区差异化 | `asia` / `eu` / `us` / `far` |
