@@ -16,7 +16,7 @@ set -euo pipefail
 # NOTE: do NOT use set -E + ERR trap on [[ ]] && chains — bash fires ERR when
 # [[ condition ]] is false (e.g. empty detail in progress_set), aborting install.
 
-VERSION="3.4.0"
+VERSION="3.4.1"
 INSTALL_PATH="/usr/local/sbin/bbr-cake-transit-exit"
 SERVICE_NAME="bbr-cake-transit-exit.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
@@ -664,22 +664,28 @@ maybe_adjust_ingress_for_cpu(){
   fi
 }
 
+# Quiet HTTP GET (short timeout); print body or empty
+http_get_quiet(){
+  local url="$1" t="${2:-3}"
+  if have_bin curl; then
+    curl -fsS --max-time "${t}" -A 'bbr-cake-transit/3.4' "${url}" 2>/dev/null || true
+  elif have_bin wget; then
+    wget -qO- --timeout="${t}" --user-agent='bbr-cake-transit/3.4' "${url}" 2>/dev/null || true
+  fi
+}
+
 # Map ISO country code → profile: asia | eu | us | far
 country_to_region(){
   local cc
   cc="$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]')"
   [[ -n "${cc}" ]] || { printf ''; return 0; }
   case "${cc}" in
-    # East / SE / South Asia + nearby hubs
     CN|HK|MO|TW|JP|KR|SG|MY|TH|VN|PH|ID|IN|BD|PK|LK|KH|LA|MM|BN|MN|NP|BT)
       printf 'asia' ;;
-    # Europe (incl. UK, Nordic, East EU, Turkey)
     DE|FR|NL|GB|UK|IE|BE|LU|CH|AT|IT|ES|PT|SE|NO|DK|FI|PL|CZ|SK|HU|RO|BG|GR|HR|SI|RS|UA|RU|TR|IS|EE|LV|LT|MD|AL|MK|BA|ME|XK)
       printf 'eu' ;;
-    # North America
     US|CA|MX|PR|VI)
       printf 'us' ;;
-    # Farther: Oceania, South America, Africa, Middle East (often longer/jittery to CN users)
     AU|NZ|FJ|PG|BR|AR|CL|CO|PE|UY|PY|BO|EC|VE|ZA|NG|EG|KE|MA|GH|TZ|ET|AE|SA|QA|KW|BH|OM|IL|IQ|IR|JO)
       printf 'far' ;;
     *)
@@ -687,78 +693,274 @@ country_to_region(){
   esac
 }
 
-# Query public IP geo (best-effort, short timeout). Sets DETECTED_* globals.
-# Returns 0 if DETECTED_REGION set.
+# Cloudflare / edge colo code → profile (reflects network location better than whois)
+colo_to_region(){
+  local c
+  c="$(printf '%s' "${1:-}" | tr '[:lower:]' '[:upper:]')"
+  [[ -n "${c}" ]] || { printf ''; return 0; }
+  case "${c}" in
+    # Asia-Pacific
+    HKG|HKG1|NRT|KIX|ICN|SIN|TPE|BKK|MNL|CGK|BOM|DEL|MAA|HYD|KUL|HAN|SGN|PNH|RGN|UBN|ALA|TAS)
+      printf 'asia' ;;
+    # North America
+    LAX|SJC|SFO|SEA|PDX|LAS|PHX|SAN|DEN|SLC|DFW|IAH|ORD|MDW|ATL|MIA|EWR|JFK|IAD|BOS|PHL|CLT|MSP|DTW|YUL|YYZ|YVR|SEA|BUF|CMH|IND|MCI|STL|BNA|AUS|SMF|OAK|BUR)
+      printf 'us' ;;
+    # Europe
+    FRA|AMS|LHR|CDG|MAD|BCN|MXP|FCO|ZRH|VIE|ARN|OSL|CPH|HEL|WAW|PRG|BUD|OTP|SOF|ATH|DUB|MAN|BRU|LIS|TXL|MUC|STR|HAM)
+      printf 'eu' ;;
+    # Oceania / SA / ME / AF
+    SYD|MEL|AKL|PER|BNE|GRU|GIG|EZE|SCL|LIM|BOG|MEX|DFW|DXB|DOH|JNB|CPT|CAI|LOS|NBO)
+      # DFW already us; keep far for true remote colos
+      case "${c}" in
+        SYD|MEL|AKL|PER|BNE|GRU|GIG|EZE|SCL|LIM|BOG|DXB|DOH|JNB|CPT|CAI|LOS|NBO) printf 'far' ;;
+        *) printf 'us' ;;
+      esac
+      ;;
+    *)
+      printf '' ;;
+  esac
+}
+
+# Cloud provider placement region string → profile
+cloud_code_to_region(){
+  local r
+  r="$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')"
+  [[ -n "${r}" ]] || { printf ''; return 0; }
+  case "${r}" in
+    na-*|us-*|ca-central*|northamerica*|america*)
+      printf 'us' ;;
+    eu-*|europe*)
+      printf 'eu' ;;
+    ap-hongkong*|ap-guangzhou*|ap-shanghai*|ap-beijing*|ap-singapore*|ap-tokyo*|ap-seoul*|ap-mumbai*|ap-bangkok*|ap-jakarta*|ap-taipei*|ap-northeast*|ap-southeast*|ap-east*|ap-south*|cn-*|asia*)
+      printf 'asia' ;;
+    sa-*|af-*|me-*|oc-*|au-*|australia*|southamerica*)
+      printf 'far' ;;
+    *)
+      # substring hints
+      if printf '%s' "${r}" | grep -qiE 'hongkong|singapore|tokyo|seoul|shanghai|beijing|mumbai'; then
+        printf 'asia'
+      elif printf '%s' "${r}" | grep -qiE 'virginia|ohio|oregon|california|silicon|ashburn|toronto|dallas|chicago'; then
+        printf 'us'
+      elif printf '%s' "${r}" | grep -qiE 'frankfurt|ireland|london|paris|stockholm|milan'; then
+        printf 'eu'
+      else
+        printf ''
+      fi
+      ;;
+  esac
+}
+
+# 1) Cloud metadata (Tencent / AWS / GCP / Azure) — most reliable for real VPS region
+detect_cloud_metadata_region(){
+  local body="" code="" prof="" src=""
+
+  # Tencent Cloud (CVM / Lighthouse) — hostname VM-xxxx often Tencent
+  for path in \
+    'http://metadata.tencentyun.com/latest/meta-data/placement/region' \
+    'http://metadata.tencentyun.com/meta-data/placement/region' \
+    'http://metadata.tencentyun.com/latest/meta-data/region' \
+    ; do
+    body="$(http_get_quiet "${path}" 2)"
+    body="$(printf '%s' "${body}" | tr -d '\r\n' | head -c 80)"
+    if [[ -n "${body}" && "${body}" != *"404"* && "${body}" != *"html"* ]]; then
+      code="${body}"
+      src="tencent-metadata"
+      break
+    fi
+  done
+
+  # AWS
+  if [[ -z "${code}" ]]; then
+    body="$(http_get_quiet 'http://169.254.169.254/latest/meta-data/placement/region' 2)"
+    body="$(printf '%s' "${body}" | tr -d '\r\n' | head -c 80)"
+    if [[ -n "${body}" && "${body}" =~ ^[a-z]{2}- ]]; then
+      code="${body}"
+      src="aws-metadata"
+    fi
+  fi
+
+  # GCP
+  if [[ -z "${code}" ]]; then
+    if have_bin curl; then
+      body="$(curl -fsS --max-time 2 -H 'Metadata-Flavor: Google' \
+        'http://metadata.google.internal/computeMetadata/v1/instance/zone' 2>/dev/null || true)"
+    fi
+    body="$(printf '%s' "${body}" | tr -d '\r\n')"
+    if [[ -n "${body}" ]]; then
+      code="${body##*/}"
+      src="gcp-metadata"
+    fi
+  fi
+
+  # Azure
+  if [[ -z "${code}" ]]; then
+    if have_bin curl; then
+      body="$(curl -fsS --max-time 2 -H 'Metadata:true' \
+        'http://169.254.169.254/metadata/instance/compute/location?api-version=2021-02-01&format=text' 2>/dev/null || true)"
+    fi
+    body="$(printf '%s' "${body}" | tr -d '\r\n')"
+    if [[ -n "${body}" && "${#body}" -lt 40 ]]; then
+      code="${body}"
+      src="azure-metadata"
+    fi
+  fi
+
+  [[ -n "${code}" ]] || return 1
+  prof="$(cloud_code_to_region "${code}")"
+  [[ -n "${prof}" ]] || return 1
+  DETECTED_REGION="${prof}"
+  DETECTED_GEO="cloud:${src} region=${code}"
+  DETECTED_COUNTRY=""
+  log "Cloud metadata [${src}]: ${code} → profile=${prof}"
+  return 0
+}
+
+# 2) Cloudflare nearest colo from THIS server (network location)
+detect_cf_colo_region(){
+  local body="" colo="" prof=""
+  body="$(http_get_quiet 'https://www.cloudflare.com/cdn-cgi/trace' 3)"
+  [[ -z "${body}" ]] && body="$(http_get_quiet 'https://1.1.1.1/cdn-cgi/trace' 3)"
+  [[ -n "${body}" ]] || return 1
+  colo="$(printf '%s\n' "${body}" | awk -F= '/^colo=/{print $2; exit}' | tr -d '\r')"
+  [[ -n "${colo}" ]] || return 1
+  prof="$(colo_to_region "${colo}")"
+  [[ -n "${prof}" ]] || {
+    log "CF colo=${colo} unmapped; ignore colo signal"
+    return 1
+  }
+  DETECTED_REGION="${prof}"
+  DETECTED_GEO="cloudflare-colo=${colo}"
+  log "Cloudflare colo: ${colo} → profile=${prof} (网络出口邻近节点，通常比 IP 库准)"
+  return 0
+}
+
+# 3) Multi-source IP whois vote (ipapi often wrong — do not trust alone)
+detect_geoip_vote_region(){
+  local body cc city org votes="" n_asia=0 n_us=0 n_eu=0 n_far=0
+  local sources="" p
+
+  # ipinfo.io
+  body="$(http_get_quiet 'https://ipinfo.io/json' 4)"
+  if [[ -n "${body}" ]]; then
+    cc="$(printf '%s' "${body}" | grep -oE '"country"[[:space:]]*:[[:space:]]*"[A-Za-z]{2}"' | head -1 | grep -oE '[A-Za-z]{2}')"
+    city="$(printf '%s' "${body}" | grep -oE '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')"
+    org="$(printf '%s' "${body}" | grep -oE '"org"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')"
+    p="$(country_to_region "${cc}")"
+    if [[ -n "${p}" ]]; then
+      sources="${sources} ipinfo=${cc}/${city:-?}->${p}"
+      case "${p}" in asia) n_asia=$((n_asia+1));; us) n_us=$((n_us+1));; eu) n_eu=$((n_eu+1));; far) n_far=$((n_far+1));; esac
+    fi
+  fi
+
+  # ip-api.com
+  body="$(http_get_quiet 'http://ip-api.com/json/?fields=status,country,countryCode,city,isp,query' 4)"
+  if printf '%s' "${body}" | grep -q '"status"[[:space:]]*:[[:space:]]*"success"'; then
+    cc="$(printf '%s' "${body}" | grep -oE '"countryCode"[[:space:]]*:[[:space:]]*"[A-Za-z]{2}"' | head -1 | grep -oE '[A-Za-z]{2}')"
+    city="$(printf '%s' "${body}" | grep -oE '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')"
+    p="$(country_to_region "${cc}")"
+    if [[ -n "${p}" ]]; then
+      sources="${sources} ip-api=${cc}/${city:-?}->${p}"
+      case "${p}" in asia) n_asia=$((n_asia+1));; us) n_us=$((n_us+1));; eu) n_eu=$((n_eu+1));; far) n_far=$((n_far+1));; esac
+    fi
+  fi
+
+  # ipapi.co (often mislabels — lower priority, still one vote)
+  body="$(http_get_quiet 'https://ipapi.co/json/' 4)"
+  if [[ -n "${body}" ]]; then
+    cc="$(printf '%s' "${body}" | grep -oE '"country_code"[[:space:]]*:[[:space:]]*"[A-Za-z]{2}"' | head -1 | grep -oE '[A-Za-z]{2}')"
+    [[ -z "${cc}" ]] && cc="$(printf '%s' "${body}" | grep -oE '"country"[[:space:]]*:[[:space:]]*"[A-Za-z]{2}"' | head -1 | grep -oE '[A-Za-z]{2}')"
+    city="$(printf '%s' "${body}" | grep -oE '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')"
+    p="$(country_to_region "${cc}")"
+    if [[ -n "${p}" ]]; then
+      sources="${sources} ipapi.co=${cc}/${city:-?}->${p}"
+      case "${p}" in asia) n_asia=$((n_asia+1));; us) n_us=$((n_us+1));; eu) n_eu=$((n_eu+1));; far) n_far=$((n_far+1));; esac
+    fi
+  fi
+
+  log "IP geo votes:${sources:- none} | asia=${n_asia} us=${n_us} eu=${n_eu} far=${n_far}"
+
+  local winner="" max=0
+  [[ "${n_asia}" -gt "${max}" ]] && { max=${n_asia}; winner=asia; }
+  [[ "${n_us}" -gt "${max}" ]] && { max=${n_us}; winner=us; }
+  [[ "${n_eu}" -gt "${max}" ]] && { max=${n_eu}; winner=eu; }
+  [[ "${n_far}" -gt "${max}" ]] && { max=${n_far}; winner=far; }
+
+  # need at least 1 vote; prefer clear majority (≥2) 
+  [[ -n "${winner}" && "${max}" -ge 1 ]] || return 1
+  DETECTED_REGION="${winner}"
+  DETECTED_GEO="ip-geo-vote winner=${winner} (votes=${max})${sources}"
+  DETECTED_COUNTRY=""
+  log "IP geo vote → profile=${winner} (votes=${max})"
+  return 0
+}
+
+# Combined auto location (priority order)
 geo_detect_region(){
   DETECTED_GEO=""
   DETECTED_COUNTRY=""
   DETECTED_REGION=""
   [[ "${GEO_DETECT}" == "1" ]] || return 1
 
-  local body="" cc="" city="" org="" src=""
+  local cloud_r="" colo_r="" vote_r=""
+  local cloud_geo="" colo_geo="" vote_geo=""
 
-  # 1) ipapi.co
-  if have_bin curl; then
-    body="$(curl -fsS --max-time 4 'https://ipapi.co/json/' 2>/dev/null || true)"
-  elif have_bin wget; then
-    body="$(wget -qO- --timeout=4 'https://ipapi.co/json/' 2>/dev/null || true)"
-  fi
-  if [[ -n "${body}" ]]; then
-    cc="$(printf '%s' "${body}" | grep -oE '"country(_code)?"[[:space:]]*:[[:space:]]*"[A-Za-z]{2}"' | head -1 | grep -oE '[A-Za-z]{2}"$' | tr -d '"')"
-    [[ -z "${cc}" ]] && cc="$(printf '%s' "${body}" | grep -oE '"country"[[:space:]]*:[[:space:]]*"[A-Za-z]{2}"' | head -1 | grep -oE '[A-Za-z]{2}')"
-    city="$(printf '%s' "${body}" | grep -oE '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')"
-    if [[ -n "${cc}" ]]; then
-      src="ipapi.co"
-    fi
+  # A) cloud metadata
+  if detect_cloud_metadata_region; then
+    cloud_r="${DETECTED_REGION}"
+    cloud_geo="${DETECTED_GEO}"
   fi
 
-  # 2) ip-api.com (HTTP; many VPS allow it)
-  if [[ -z "${cc}" ]]; then
-    body=""
-    if have_bin curl; then
-      body="$(curl -fsS --max-time 4 'http://ip-api.com/json/?fields=status,country,countryCode,city,isp,query' 2>/dev/null || true)"
-    elif have_bin wget; then
-      body="$(wget -qO- --timeout=4 'http://ip-api.com/json/?fields=status,country,countryCode,city,isp,query' 2>/dev/null || true)"
-    fi
-    if printf '%s' "${body}" | grep -q '"status"[[:space:]]*:[[:space:]]*"success"'; then
-      cc="$(printf '%s' "${body}" | grep -oE '"countryCode"[[:space:]]*:[[:space:]]*"[A-Za-z]{2}"' | head -1 | grep -oE '[A-Za-z]{2}')"
-      city="$(printf '%s' "${body}" | grep -oE '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')"
-      org="$(printf '%s' "${body}" | grep -oE '"isp"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')"
-      src="ip-api.com"
-    fi
+  # B) CF colo
+  DETECTED_REGION=""; DETECTED_GEO=""
+  if detect_cf_colo_region; then
+    colo_r="${DETECTED_REGION}"
+    colo_geo="${DETECTED_GEO}"
   fi
 
-  # 3) ipinfo.io
-  if [[ -z "${cc}" ]]; then
-    body=""
-    if have_bin curl; then
-      body="$(curl -fsS --max-time 4 'https://ipinfo.io/json' 2>/dev/null || true)"
-    elif have_bin wget; then
-      body="$(wget -qO- --timeout=4 'https://ipinfo.io/json' 2>/dev/null || true)"
-    fi
-    if [[ -n "${body}" ]]; then
-      cc="$(printf '%s' "${body}" | grep -oE '"country"[[:space:]]*:[[:space:]]*"[A-Za-z]{2}"' | head -1 | grep -oE '[A-Za-z]{2}')"
-      city="$(printf '%s' "${body}" | grep -oE '"city"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')"
-      org="$(printf '%s' "${body}" | grep -oE '"org"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')"
-      src="ipinfo.io"
-    fi
+  # C) multi IP geo vote
+  DETECTED_REGION=""; DETECTED_GEO=""
+  if detect_geoip_vote_region; then
+    vote_r="${DETECTED_REGION}"
+    vote_geo="${DETECTED_GEO}"
   fi
 
-  [[ -n "${cc}" ]] || {
-    warn "Geo detect failed (timeout/blocked); will use RTT fallback"
-    return 1
-  }
+  log "位置信号汇总: cloud=${cloud_r:-?} colo=${colo_r:-?} ip-vote=${vote_r:-?}"
 
-  DETECTED_COUNTRY="${cc}"
-  DETECTED_GEO="${city:-?} / ${cc}"
-  [[ -n "${org}" ]] && DETECTED_GEO="${DETECTED_GEO} (${org})"
-  DETECTED_REGION="$(country_to_region "${cc}")"
-  if [[ -z "${DETECTED_REGION}" ]]; then
-    warn "Country ${cc} not in map; RTT fallback"
-    return 1
+  # Priority: cloud metadata > CF colo > IP vote
+  # If colo and ip-vote strongly disagree, prefer colo (whois 经常错标 HK)
+  if [[ -n "${cloud_r}" ]]; then
+    DETECTED_REGION="${cloud_r}"
+    DETECTED_GEO="${cloud_geo}"
+    if [[ -n "${colo_r}" && "${colo_r}" != "${cloud_r}" ]]; then
+      warn "云元数据=${cloud_r} 与 CF colo=${colo_r} 不一致；优先云元数据"
+    fi
+    if [[ -n "${vote_r}" && "${vote_r}" != "${cloud_r}" ]]; then
+      warn "云元数据=${cloud_r} 与 IP库投票=${vote_r} 不一致；优先云元数据（IP库常误标）"
+    fi
+    log "最终位置: profile=${DETECTED_REGION} via cloud-metadata (${DETECTED_GEO})"
+    return 0
   fi
-  log "Geo detect via ${src}: ${DETECTED_GEO} → profile=${DETECTED_REGION}"
-  return 0
+
+  if [[ -n "${colo_r}" ]]; then
+    DETECTED_REGION="${colo_r}"
+    DETECTED_GEO="${colo_geo}"
+    if [[ -n "${vote_r}" && "${vote_r}" != "${colo_r}" ]]; then
+      warn "CF 网络节点=${colo_r} 与 IP库=${vote_r} 不一致；优先 Cloudflare colo（IP库把美区标成香港很常见）"
+    fi
+    log "最终位置: profile=${DETECTED_REGION} via cloudflare-colo (${DETECTED_GEO})"
+    return 0
+  fi
+
+  if [[ -n "${vote_r}" ]]; then
+    DETECTED_REGION="${vote_r}"
+    DETECTED_GEO="${vote_geo}"
+    warn "仅依赖 IP 地理库（可能不准）。若实际在美国请: REGION=us"
+    log "最终位置: profile=${DETECTED_REGION} via ip-geo-vote only"
+    return 0
+  fi
+
+  warn "所有位置信号失败；将用 RTT 回退"
+  return 1
 }
 
 # Apply profile defaults: CAKE_RTT + safety factor (if not user-overridden)
@@ -854,25 +1056,20 @@ resolve_region_tuning(){
       ;;
   esac
 
-  # auto: geo first
-  step "识别服务器位置 / 选择地区调优档位"
+  # auto: multi-signal location
+  step "识别服务器位置 / 选择地区调优档位（云元数据 > CF节点 > IP库投票）"
+  log "提示: IP 地理库常把美区/跨国线路误标成香港；可用 REGION=us 强制覆盖"
   if [[ "${reg}" == "auto" ]] && geo_detect_region; then
     apply_region_profile "${DETECTED_REGION}"
-    # Fine-tune RTT with ping if user did not force CAKE_RTT
     if [[ -z "${OVERRIDE_CAKE_RTT}" ]]; then
-      local rtt_s rtt_ms
+      local rtt_s rtt_ms prof_ms
       rtt_s="$(suggest_rtt_from_ping 1.1.1.1 || true)"
       if [[ -n "${rtt_s}" ]]; then
         rtt_ms="$(printf '%s' "${rtt_s}" | grep -oE '[0-9]+' | head -1)"
-        # If geo says asia but ping RTT is huge, bump toward longer profile hint only on RTT value
-        if [[ -n "${rtt_ms}" && "${rtt_ms}" -gt 0 ]]; then
-          # Blend: use max(profile_default_ms, ping_suggest_ms) lightly — prefer ping if much larger
-          local prof_ms
-          prof_ms="$(printf '%s' "${CAKE_RTT}" | grep -oE '[0-9]+' | head -1)"
-          if [[ -n "${prof_ms}" && "${rtt_ms}" -gt $((prof_ms + 40)) ]]; then
-            CAKE_RTT="${rtt_s}"
-            log "Ping RTT ${rtt_ms}ms >> profile ${prof_ms}ms → use CAKE_RTT=${CAKE_RTT}"
-          fi
+        prof_ms="$(printf '%s' "${CAKE_RTT}" | grep -oE '[0-9]+' | head -1)"
+        if [[ -n "${rtt_ms}" && -n "${prof_ms}" && "${rtt_ms}" -gt $((prof_ms + 50)) ]]; then
+          CAKE_RTT="${rtt_s}"
+          log "实测 RTT ${rtt_ms}ms 明显高于档位 ${prof_ms}ms → CAKE_RTT=${CAKE_RTT}"
         fi
       fi
     fi
@@ -895,7 +1092,7 @@ resolve_region_tuning(){
     return 0
   fi
 
-  warn "Geo+RTT both failed; keep CAKE_RTT=${CAKE_RTT} safety=${BANDWIDTH_SAFETY_FACTOR}"
+  warn "位置识别失败；保持 CAKE_RTT=${CAKE_RTT}。美区请: REGION=us"
   REGION_PROFILE="default"
   REGION_NOTE="无地理/无RTT，使用当前默认"
   return 0
