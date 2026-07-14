@@ -1,4 +1,4 @@
-# BBR + CAKE 中转服务器一键调优 v3.1
+# BBR + CAKE 中转服务器一键调优 v3.2
 
 面向 **Linux 中转 / 出口 / 共享节点** 的生产向网络调优脚本。  
 **推荐环境：Debian / Ubuntu**（其它带 systemd + iproute2 的 Linux 一般也可用）。
@@ -96,8 +96,19 @@ wget -qO- https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning | sudo
 bbr-cake-transit-exit status      # 状态 / 进度 / 定时器 / 地区
 bbr-cake-transit-exit retune      # 立刻重测并应用
 bbr-cake-transit-exit apply       # 用已有配置应用
-bbr-cake-transit-exit uninstall   # 卸载
+bbr-cake-transit-exit cleanup     # 清运行时规则 + 临时文件（保留配置/服务）
+bbr-cake-transit-exit uninstall   # 完全卸载
 ```
+
+### 自动清理（测速结束后）
+
+| 会清理 | 不清理 |
+|--------|--------|
+| `/tmp/bbr-cake.*` 会话目录 | 限速配置 `/etc/default/...` |
+| 下载样本、bench 工作区 | systemd 服务与每日重测定时器 |
+| 超过 2h 的残留临时目录 | sysctl、安装脚本 |
+| 过大的 retune 日志（保留尾部） | 测速缓存、进度文件 |
+| Ctrl+C 中断时尽量删临时文件 | 正在生效的 CAKE（cleanup 才拆） |
 
 进度与日志：
 
