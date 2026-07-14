@@ -1,16 +1,29 @@
 #!/usr/bin/env bash
-# BBR + CAKE tuning for transit + exit + shared-node servers.
-# Commands: apply, install, status, cleanup, uninstall
+# BBR + CAKE tuning for Linux 中转 / 出口 / 共享节点 (transit + exit + shared-node).
+# Default: one-shot auto = multi-method speedtest → fill rates → apply → install.
+#
+# Target: Linux server used as a transit/relay (中转) node — NOT a general
+# campus/business app server unless you only need BBR+CAKE without forwarding.
+#
+# Commands: auto (default), detect, apply, install, status, cleanup, uninstall, help
 # Requirements: Linux kernel >= 5.4, iproute2 tc, sch_cake/ifb support.
+#
+# One-shot on server:
+#   curl -fsSL <url> | bash
+#   # or
+#   sudo bash Tuning
 set -euo pipefail
 
+VERSION="2.1.0"
 INSTALL_PATH="/usr/local/sbin/bbr-cake-transit-exit"
 SERVICE_NAME="bbr-cake-transit-exit.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
 ENV_FILE="/etc/default/bbr-cake-transit-exit"
 SYSCTL_FILE="/etc/sysctl.d/99-bbr-cake-transit-exit.conf"
-SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/JackHONGhy/Tuning/refs/heads/main/Tuning}"
+DETECT_CACHE_FILE="/var/cache/bbr-cake-transit-exit/last-detect.env"
+SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning}"
 
+# ---------- CLI / env overrides (highest priority) ----------
 OVERRIDE_ENABLE_LIMITS="${ENABLE_LIMITS:-}"
 OVERRIDE_UP_RATE="${UP_RATE:-}"
 OVERRIDE_DOWN_RATE="${DOWN_RATE:-}"
@@ -30,14 +43,30 @@ OVERRIDE_MSS_CLAMP_HOST_OUTPUT="${MSS_CLAMP_HOST_OUTPUT:-}"
 OVERRIDE_DISABLE_GRO_GSO_ON_VPN="${DISABLE_GRO_GSO_ON_VPN:-}"
 OVERRIDE_UP_OVERRIDES="${UP_OVERRIDES:-}"
 OVERRIDE_DOWN_OVERRIDES="${DOWN_OVERRIDES:-}"
+OVERRIDE_BANDWIDTH_SOURCE="${BANDWIDTH_SOURCE:-}"
+OVERRIDE_BANDWIDTH_SAFETY_FACTOR="${BANDWIDTH_SAFETY_FACTOR:-}"
+OVERRIDE_AUTO_DETECT_BW="${AUTO_DETECT_BW:-}"
+OVERRIDE_AUTO_CONFIRM_PEAK="${AUTO_CONFIRM_PEAK:-}"
+OVERRIDE_DETECT_METHODS="${DETECT_METHODS:-}"
+OVERRIDE_IPERF3_SERVER="${IPERF3_SERVER:-}"
+OVERRIDE_IPERF3_DURATION="${IPERF3_DURATION:-}"
+OVERRIDE_ALLOW_REMOTE_BENCH="${ALLOW_REMOTE_BENCH:-}"
+OVERRIDE_BENCH_URL="${BENCH_URL:-}"
+OVERRIDE_HTTP_TEST_URLS="${HTTP_TEST_URLS:-}"
+OVERRIDE_PROFILE="${PROFILE:-}"
+OVERRIDE_USE_DETECT_CACHE="${USE_DETECT_CACHE:-}"
+OVERRIDE_AUTO_INSTALL="${AUTO_INSTALL:-}"
+OVERRIDE_SKIP_DETECT="${SKIP_DETECT:-}"
 
 if [[ -f "${ENV_FILE}" ]]; then
+  # shellcheck disable=SC1090
   . "${ENV_FILE}"
 fi
 
-ENABLE_LIMITS="${OVERRIDE_ENABLE_LIMITS:-${ENABLE_LIMITS:-1}}"
-BANDWIDTH_UP_DEFAULT="${OVERRIDE_UP_RATE:-${OVERRIDE_BANDWIDTH_UP_DEFAULT:-${UP_RATE:-${BANDWIDTH_UP_DEFAULT:-285Mbit}}}}"
-BANDWIDTH_DOWN_DEFAULT="${OVERRIDE_DOWN_RATE:-${OVERRIDE_BANDWIDTH_DOWN_DEFAULT:-${DOWN_RATE:-${BANDWIDTH_DOWN_DEFAULT:-950Mbit}}}}"
+# Defaults after env file (CLI env still wins via OVERRIDE_*)
+ENABLE_LIMITS="${OVERRIDE_ENABLE_LIMITS:-${ENABLE_LIMITS:-}}"
+BANDWIDTH_UP_DEFAULT="${OVERRIDE_UP_RATE:-${OVERRIDE_BANDWIDTH_UP_DEFAULT:-${UP_RATE:-${BANDWIDTH_UP_DEFAULT:-}}}}"
+BANDWIDTH_DOWN_DEFAULT="${OVERRIDE_DOWN_RATE:-${OVERRIDE_BANDWIDTH_DOWN_DEFAULT:-${DOWN_RATE:-${BANDWIDTH_DOWN_DEFAULT:-}}}}"
 CAKE_RTT="${OVERRIDE_CAKE_RTT:-${CAKE_RTT:-50ms}}"
 BASE_CAKE_OPTS="${OVERRIDE_BASE_CAKE_OPTS:-${BASE_CAKE_OPTS:-diffserv3 triple-isolate ack-filter split-gso}}"
 ENABLE_FORWARDING="${OVERRIDE_ENABLE_FORWARDING:-${ENABLE_FORWARDING:-1}}"
@@ -52,10 +81,43 @@ MSS_CLAMP_HOST_OUTPUT="${OVERRIDE_MSS_CLAMP_HOST_OUTPUT:-${MSS_CLAMP_HOST_OUTPUT
 DISABLE_GRO_GSO_ON_VPN="${OVERRIDE_DISABLE_GRO_GSO_ON_VPN:-${DISABLE_GRO_GSO_ON_VPN:-0}}"
 UP_OVERRIDES="${OVERRIDE_UP_OVERRIDES:-${UP_OVERRIDES:-}}"
 DOWN_OVERRIDES="${OVERRIDE_DOWN_OVERRIDES:-${DOWN_OVERRIDES:-}}"
+BANDWIDTH_SOURCE="${OVERRIDE_BANDWIDTH_SOURCE:-${BANDWIDTH_SOURCE:-none}}"
+BANDWIDTH_SAFETY_FACTOR="${OVERRIDE_BANDWIDTH_SAFETY_FACTOR:-${BANDWIDTH_SAFETY_FACTOR:-0.92}}"
+AUTO_DETECT_BW="${OVERRIDE_AUTO_DETECT_BW:-${AUTO_DETECT_BW:-0}}"
+AUTO_CONFIRM_PEAK="${OVERRIDE_AUTO_CONFIRM_PEAK:-${AUTO_CONFIRM_PEAK:-0}}"
+DETECT_METHODS="${OVERRIDE_DETECT_METHODS:-${DETECT_METHODS:-http,speedtest,iperf3,bench}}"
+IPERF3_SERVER="${OVERRIDE_IPERF3_SERVER:-${IPERF3_SERVER:-}}"
+IPERF3_DURATION="${OVERRIDE_IPERF3_DURATION:-${IPERF3_DURATION:-8}}"
+ALLOW_REMOTE_BENCH="${OVERRIDE_ALLOW_REMOTE_BENCH:-${ALLOW_REMOTE_BENCH:-0}}"
+BENCH_URL="${OVERRIDE_BENCH_URL:-${BENCH_URL:-https://bench.sh}}"
+# Comma/space separated large-file URLs for download timing (下行)
+HTTP_TEST_URLS="${OVERRIDE_HTTP_TEST_URLS:-${HTTP_TEST_URLS:-https://speed.cloudflare.com/__down?bytes=100000000 https://github.com/gdraheim/docker-systemctl-replacement/archive/refs/heads/master.zip}}"
+PROFILE="${OVERRIDE_PROFILE:-${PROFILE:-transit}}"
+USE_DETECT_CACHE="${OVERRIDE_USE_DETECT_CACHE:-${USE_DETECT_CACHE:-1}}"
+# auto 模式：测完是否 install 持久化（默认开）
+AUTO_INSTALL="${OVERRIDE_AUTO_INSTALL:-${AUTO_INSTALL:-1}}"
+# auto 模式：跳过测速（仅当已手填 UP/DOWN 时有用）
+SKIP_DETECT="${OVERRIDE_SKIP_DETECT:-${SKIP_DETECT:-0}}"
+
+# host profile: no forwarding, keep rp_filter stricter via write_sysctl
+if [[ "${PROFILE}" == "host" ]]; then
+  ENABLE_FORWARDING="${OVERRIDE_ENABLE_FORWARDING:-${ENABLE_FORWARDING:-0}}"
+fi
 
 declare -A BANDWIDTH_UP_OVERRIDES=()
 declare -A BANDWIDTH_DOWN_OVERRIDES=()
 declare -A CANDIDATES=()
+
+# detect results: parallel arrays
+DETECT_METHOD_NAMES=()
+DETECT_UP_MBITS=()
+DETECT_DOWN_MBITS=()
+DETECT_NOTES=()
+
+PEAK_UP_MBIT=""
+PEAK_DOWN_MBIT=""
+SUGGEST_UP=""
+SUGGEST_DOWN=""
 
 log(){ printf '[*] %s\n' "$*"; }
 ok(){ printf '[OK] %s\n' "$*"; }
@@ -70,22 +132,127 @@ need_bin(){
   command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"
 }
 
+have_bin(){
+  command -v "$1" >/dev/null 2>&1
+}
+
+is_tty(){
+  [[ -t 0 && -t 1 ]]
+}
+
 usage(){
   cat <<EOF
-Usage:
-  $0 apply       Apply BBR + CAKE tuning now. This is the default command.
-  $0 install     Install script, write config, create and enable systemd service.
-  $0 status      Show sysctl, service, qdisc and MSS status.
-  $0 cleanup     Remove runtime qdisc/IFB/MSS rules created by this script.
-  $0 uninstall   Disable service, cleanup runtime state and remove installed files.
+BBR + CAKE 中转调优 v${VERSION}
 
-Environment overrides:
-  UP_RATE=285Mbit DOWN_RATE=950Mbit $0 apply
-  CAKE_RTT=100ms ENABLE_INGRESS_SHAPING=0 $0 apply
-  EXTRA_WAN_INTERFACES="ens18 ens19" $0 apply
-  UP_OVERRIDES="ens18=285Mbit ens19=900Mbit" $0 apply
-  DOWN_OVERRIDES="ens18=950Mbit ens19=1800Mbit" $0 apply
+一键（默认，无需再分步执行）:
+  sudo bash $0
+  sudo bash $0 auto
+
+流程: 多方法测速 → 取峰值×安全系数自动填入 → 应用 BBR+CAKE → 安装开机持久化
+无交互确认。测速会短时打满带宽。
+
+其它命令:
+  $0 detect      仅测速并写缓存（可交互）
+  $0 apply       仅应用（用手动速率/缓存/配置，默认不重新测速）
+  $0 install     安装脚本并启用 systemd
+  $0 status      查看状态
+  $0 cleanup     清理运行时 qdisc/IFB/MSS
+  $0 uninstall   卸载
+  $0 help        帮助
+
+测速方法 DETECT_METHODS（默认 http,speedtest,iperf3,bench）:
+  http / speedtest / iperf3(需 IPERF3_SERVER) / bench(auto 默认允许远程 bench)
+
+示例:
+  # 中转机一键全自动
+  sudo bash $0
+
+  # 指定 iperf3 对端后一键
+  sudo IPERF3_SERVER=1.2.3.4 bash $0
+
+  # 已知带宽，跳过测速直接应用+安装
+  sudo UP_RATE=90Mbit DOWN_RATE=900Mbit SKIP_DETECT=1 bash $0
+
+  # 只测速不应用
+  sudo bash $0 detect
+
+  # 一键但不装 systemd（只当次生效）
+  sudo AUTO_INSTALL=0 bash $0
+
+  # 禁止远程 bench
+  sudo ALLOW_REMOTE_BENCH=0 bash $0
+
+环境变量:
+  UP_RATE DOWN_RATE CAKE_RTT BANDWIDTH_SAFETY_FACTOR=0.92
+  DETECT_METHODS IPERF3_SERVER AUTO_INSTALL=1 SKIP_DETECT=0
+  ALLOW_REMOTE_BENCH BENCH_URL HTTP_TEST_URLS PROFILE=transit|host
 EOF
+}
+
+# ---------- unit helpers ----------
+# Convert rate strings like 950Mbit, 1Gbit, 100mbit, 123.4 to integer Mbit (floor)
+rate_to_mbit(){
+  local s="${1:-}"
+  s="$(printf '%s' "${s}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+  [[ -n "${s}" ]] || { printf ''; return 0; }
+
+  if [[ "${s}" =~ ^([0-9]+(\.[0-9]+)?)gbit$ ]]; then
+    awk -v v="${BASH_REMATCH[1]}" 'BEGIN{printf "%d", int(v*1000+0.5)}'
+    return 0
+  fi
+  if [[ "${s}" =~ ^([0-9]+(\.[0-9]+)?)mbit$ ]]; then
+    awk -v v="${BASH_REMATCH[1]}" 'BEGIN{printf "%d", int(v+0.5)}'
+    return 0
+  fi
+  if [[ "${s}" =~ ^([0-9]+(\.[0-9]+)?)kbit$ ]]; then
+    awk -v v="${BASH_REMATCH[1]}" 'BEGIN{printf "%d", int(v/1000+0.5)}'
+    return 0
+  fi
+  if [[ "${s}" =~ ^([0-9]+(\.[0-9]+)?)bit$ ]]; then
+    awk -v v="${BASH_REMATCH[1]}" 'BEGIN{printf "%d", int(v/1000000+0.5)}'
+    return 0
+  fi
+  if [[ "${s}" =~ ^([0-9]+(\.[0-9]+)?)(mbps|mb/s|m)$ ]]; then
+    awk -v v="${BASH_REMATCH[1]}" 'BEGIN{printf "%d", int(v+0.5)}'
+    return 0
+  fi
+  if [[ "${s}" =~ ^([0-9]+(\.[0-9]+)?)(gbps|gb/s|g)$ ]]; then
+    awk -v v="${BASH_REMATCH[1]}" 'BEGIN{printf "%d", int(v*1000+0.5)}'
+    return 0
+  fi
+  if [[ "${s}" =~ ^([0-9]+(\.[0-9]+)?)$ ]]; then
+    awk -v v="${BASH_REMATCH[1]}" 'BEGIN{printf "%d", int(v+0.5)}'
+    return 0
+  fi
+  printf ''
+}
+
+mbit_to_rate(){
+  local m="${1:-0}"
+  if [[ -z "${m}" || "${m}" -le 0 ]]; then
+    printf ''
+    return 0
+  fi
+  printf '%sMbit' "${m}"
+}
+
+# Apply safety factor to integer Mbit → rate string
+mbit_with_safety(){
+  local m="${1:-0}"
+  local f="${BANDWIDTH_SAFETY_FACTOR:-0.92}"
+  local out
+  out="$(awk -v m="${m}" -v f="${f}" 'BEGIN{
+    if (m<=0) { print 0; exit }
+    r=int(m*f+0.5)
+    if (r<1) r=1
+    print r
+  }')"
+  mbit_to_rate "${out}"
+}
+
+max_int(){
+  local a="${1:-0}" b="${2:-0}"
+  [[ "${a}" -gt "${b}" ]] && printf '%s' "${a}" || printf '%s' "${b}"
 }
 
 parse_overrides(){
@@ -117,7 +284,7 @@ preflight(){
   need_bin grep
   need_bin sed
 
-  if command -v modprobe >/dev/null 2>&1; then
+  if have_bin modprobe; then
     modprobe tcp_bbr 2>/dev/null || true
     for module in sch_cake ifb cls_matchall act_mirred; do
       modprobe "${module}" 2>/dev/null || true
@@ -132,6 +299,11 @@ preflight(){
 }
 
 write_sysctl(){
+  local rp_filter=0
+  if [[ "${PROFILE}" == "host" ]]; then
+    rp_filter=1
+  fi
+
   log "Writing ${SYSCTL_FILE}"
 
   cat >"${SYSCTL_FILE}" <<EOF
@@ -166,8 +338,8 @@ net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.send_redirects = 0
 net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.rp_filter = 0
-net.ipv4.conf.default.rp_filter = 0
+net.ipv4.conf.all.rp_filter = ${rp_filter}
+net.ipv4.conf.default.rp_filter = ${rp_filter}
 EOF
 
   sysctl -p "${SYSCTL_FILE}" >/dev/null
@@ -179,13 +351,13 @@ detect_cake_nat(){
 
   local has_nat=0
 
-  if command -v iptables >/dev/null 2>&1; then
+  if have_bin iptables; then
     if iptables -t nat -S POSTROUTING 2>/dev/null | grep -Eiq 'MASQUERADE|SNAT'; then
       has_nat=1
     fi
   fi
 
-  if command -v nft >/dev/null 2>&1; then
+  if have_bin nft; then
     if nft list ruleset 2>/dev/null | grep -Eiq 'masquerade|snat'; then
       has_nat=1
     fi
@@ -280,7 +452,12 @@ append_cake_opt(){
 }
 
 apply_qdisc(){
-  log "Egress interfaces: $(printf '%s ' "${!CANDIDATES[@]}" | xargs)"
+  log "Egress interfaces: $(printf '%s ' "${!CANDIDATES[@]}" | xargs 2>/dev/null || printf '%s ' "${!CANDIDATES[@]}")"
+
+  local limits_on=0
+  if [[ "${ENABLE_LIMITS}" == "1" ]]; then
+    limits_on=1
+  fi
 
   local dev ifb cake_opts up_rate down_rate
   for dev in "${!CANDIDATES[@]}"; do
@@ -291,7 +468,7 @@ apply_qdisc(){
     cleanup_qdisc "${dev}"
 
     cake_opts="${BASE_CAKE_OPTS}"
-    if [[ -n "${CAKE_NAT_OPT}" ]]; then
+    if [[ -n "${CAKE_NAT_OPT:-}" ]]; then
       cake_opts="$(append_cake_opt "${cake_opts}" "${CAKE_NAT_OPT}")"
     fi
     if is_pppoe "${dev}"; then
@@ -301,11 +478,13 @@ apply_qdisc(){
     up_rate="${BANDWIDTH_UP_OVERRIDES[$dev]:-${BANDWIDTH_UP_DEFAULT}}"
     down_rate="${BANDWIDTH_DOWN_OVERRIDES[$dev]:-${BANDWIDTH_DOWN_DEFAULT}}"
 
-    if [[ "${ENABLE_LIMITS}" -eq 1 ]]; then
+    if [[ "${limits_on}" -eq 1 && -n "${up_rate}" ]]; then
       echo "  - egress CAKE: ${up_rate}, rtt ${CAKE_RTT}, opts [${cake_opts}]"
+      # shellcheck disable=SC2086
       tc qdisc replace dev "${dev}" root cake bandwidth "${up_rate}" rtt "${CAKE_RTT}" ${cake_opts}
     else
       echo "  - egress CAKE: unlimited, rtt ${CAKE_RTT}, opts [${cake_opts}]"
+      # shellcheck disable=SC2086
       tc qdisc replace dev "${dev}" root cake rtt "${CAKE_RTT}" ${cake_opts}
     fi
 
@@ -328,17 +507,19 @@ apply_qdisc(){
 
       cleanup_qdisc "${ifb}"
 
-      if [[ "${ENABLE_LIMITS}" -eq 1 ]]; then
+      if [[ "${limits_on}" -eq 1 && -n "${down_rate}" ]]; then
         echo "  - ingress CAKE@${ifb}: ${down_rate}, rtt ${CAKE_RTT}, opts [${cake_opts}] + ingress"
+        # shellcheck disable=SC2086
         tc qdisc replace dev "${ifb}" root cake bandwidth "${down_rate}" rtt "${CAKE_RTT}" ${cake_opts} ingress
       else
         echo "  - ingress CAKE@${ifb}: unlimited, rtt ${CAKE_RTT}, opts [${cake_opts}] + ingress"
+        # shellcheck disable=SC2086
         tc qdisc replace dev "${ifb}" root cake rtt "${CAKE_RTT}" ${cake_opts} ingress
       fi
     fi
 
     if [[ "${DISABLE_GRO_GSO_ON_VPN}" -eq 1 ]] && is_vpn_if "${dev}"; then
-      if command -v ethtool >/dev/null 2>&1; then
+      if have_bin ethtool; then
         ethtool -K "${dev}" gro off gso off tso off 2>/dev/null || true
         echo "  - Disabled GRO/GSO/TSO on ${dev}"
       fi
@@ -351,7 +532,7 @@ add_mss_if_absent(){
   local table="$2"
   shift 2
 
-  command -v "${bin}" >/dev/null 2>&1 || return 0
+  have_bin "${bin}" || return 0
   "${bin}" -t "${table}" -C "$@" 2>/dev/null || "${bin}" -t "${table}" -A "$@"
 }
 
@@ -360,7 +541,7 @@ delete_mss_if_present(){
   local table="$2"
   shift 2
 
-  command -v "${bin}" >/dev/null 2>&1 || return 0
+  have_bin "${bin}" || return 0
   while "${bin}" -t "${table}" -C "$@" 2>/dev/null; do
     "${bin}" -t "${table}" -D "$@" 2>/dev/null || break
   done
@@ -415,10 +596,648 @@ show_qdisc_status(){
   done
 }
 
-apply_cmd(){
+# ---------- bandwidth detect ----------
+record_detect(){
+  local method="$1"
+  local up_mbit="$2"   # empty or integer Mbit
+  local down_mbit="$3"
+  local note="$4"
+
+  DETECT_METHOD_NAMES+=("${method}")
+  DETECT_UP_MBITS+=("${up_mbit}")
+  DETECT_DOWN_MBITS+=("${down_mbit}")
+  DETECT_NOTES+=("${note}")
+
+  local up_s="${up_mbit:-n/a}" down_s="${down_mbit:-n/a}"
+  [[ -n "${up_mbit}" ]] && up_s="${up_mbit} Mbit"
+  [[ -n "${down_mbit}" ]] && down_s="${down_mbit} Mbit"
+  log "Result [${method}]: up=${up_s}  down=${down_s}  (${note})"
+}
+
+# HTTP multi-URL download → downlink Mbit estimate
+detect_http(){
+  log "Method http: multi-URL download timing"
+
+  if ! have_bin curl && ! have_bin wget; then
+    record_detect "http" "" "" "skipped: need curl or wget"
+    return 0
+  fi
+
+  local urls="${HTTP_TEST_URLS//,/ }"
+  local url best=0 got=0 mbit bytes secs tmp
+  tmp="$(mktemp)"
+
+  for url in ${urls}; do
+    [[ -n "${url}" ]] || continue
+    log "  downloading sample: ${url}"
+    mbit=""
+    if have_bin curl; then
+      # -w writes metrics to stdout; body to tmp
+      local meta
+      meta="$(curl -L --max-time 45 -o "${tmp}" -s -w '%{size_download} %{time_total}' "${url}" 2>/dev/null || true)"
+      bytes="$(printf '%s' "${meta}" | awk '{print $1}')"
+      secs="$(printf '%s' "${meta}" | awk '{print $2}')"
+    else
+      local start end
+      start="$(date +%s.%N 2>/dev/null || date +%s)"
+      wget -q -O "${tmp}" --timeout=45 "${url}" 2>/dev/null || true
+      end="$(date +%s.%N 2>/dev/null || date +%s)"
+      bytes="$(wc -c <"${tmp}" 2>/dev/null | tr -d ' ' || echo 0)"
+      secs="$(awk -v s="${start}" -v e="${end}" 'BEGIN{d=e-s; if(d<=0) d=0.001; print d}')"
+    fi
+
+    if [[ -n "${bytes}" && -n "${secs}" ]]; then
+      mbit="$(awk -v b="${bytes}" -v t="${secs}" 'BEGIN{
+        if (t<=0 || b<500000) { print 0; exit }
+        printf "%d", int((b*8)/(t*1000000)+0.5)
+      }')"
+      if [[ "${mbit}" -gt 5 ]]; then
+        got=1
+        best="$(max_int "${best}" "${mbit}")"
+        log "  → ~${mbit} Mbit down (${bytes} bytes in ${secs}s)"
+      else
+        log "  → sample too small or too slow, ignored"
+      fi
+    fi
+  done
+  rm -f "${tmp}"
+
+  if [[ "${got}" -eq 1 ]]; then
+    record_detect "http" "" "${best}" "download peak across URLs"
+  else
+    record_detect "http" "" "" "no usable download sample"
+  fi
+}
+
+# speedtest-cli or official ookla speedtest
+detect_speedtest(){
+  log "Method speedtest: local CLI if present"
+
+  local up="" down="" note=""
+
+  if have_bin speedtest; then
+    local out
+    # Ookla CLI JSON: download/upload.bandwidth are bytes/sec
+    if out="$(speedtest --accept-license --accept-gdpr -f json 2>/dev/null)"; then
+      if have_bin python3; then
+        down="$(printf '%s' "${out}" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(int(d["download"]["bandwidth"]*8/1e6+0.5))' 2>/dev/null || true)"
+        up="$(printf '%s' "${out}" | python3 -c 'import sys,json; d=json.load(sys.stdin); print(int(d["upload"]["bandwidth"]*8/1e6+0.5))' 2>/dev/null || true)"
+      else
+        down="$(printf '%s' "${out}" | tr '{' '\n' | grep -E '"bandwidth"' | head -1 | grep -oE '[0-9]+' | head -1)"
+        up="$(printf '%s' "${out}" | tr '{' '\n' | grep -E '"bandwidth"' | sed -n '2p' | grep -oE '[0-9]+' | head -1)"
+        [[ -n "${down}" ]] && down="$(awk -v b="${down}" 'BEGIN{printf "%d", int(b*8/1000000+0.5)}')"
+        [[ -n "${up}" ]] && up="$(awk -v b="${up}" 'BEGIN{printf "%d", int(b*8/1000000+0.5)}')"
+      fi
+      note="ookla speedtest JSON"
+    fi
+    if [[ -z "${down}" && -z "${up}" ]]; then
+      if out="$(speedtest --simple 2>/dev/null || speedtest 2>/dev/null)"; then
+        down="$(printf '%s' "${out}" | grep -iE 'Download' | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)"
+        up="$(printf '%s' "${out}" | grep -iE 'Upload' | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)"
+        down="$(rate_to_mbit "${down}")"
+        up="$(rate_to_mbit "${up}")"
+        note="speedtest text"
+      fi
+    fi
+  fi
+
+  if [[ -z "${down}" && -z "${up}" ]] && have_bin speedtest-cli; then
+    local out
+    if out="$(speedtest-cli --simple 2>/dev/null)"; then
+      down="$(printf '%s' "${out}" | grep -i Download | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)"
+      up="$(printf '%s' "${out}" | grep -i Upload | grep -oE '[0-9]+(\.[0-9]+)?' | head -1)"
+      down="$(rate_to_mbit "${down}")"
+      up="$(rate_to_mbit "${up}")"
+      note="speedtest-cli"
+    fi
+  fi
+
+  if [[ -z "${down}" && -z "${up}" ]]; then
+    record_detect "speedtest" "" "" "skipped: install speedtest or speedtest-cli"
+    return 0
+  fi
+  record_detect "speedtest" "${up}" "${down}" "${note:-speedtest}"
+}
+
+detect_iperf3(){
+  log "Method iperf3: point-to-point"
+
+  if ! have_bin iperf3; then
+    record_detect "iperf3" "" "" "skipped: iperf3 not installed"
+    return 0
+  fi
+  if [[ -z "${IPERF3_SERVER}" ]]; then
+    record_detect "iperf3" "" "" "skipped: set IPERF3_SERVER=host"
+    return 0
+  fi
+
+  local dur="${IPERF3_DURATION:-8}"
+  local down_json up_json down="" up=""
+
+  log "  iperf3 download (-R) vs ${IPERF3_SERVER} (${dur}s)"
+  if down_json="$(iperf3 -c "${IPERF3_SERVER}" -t "${dur}" -J -R 2>/dev/null)"; then
+    down="$(printf '%s' "${down_json}" | grep -oE '"bits_per_second"[[:space:]]*:[[:space:]]*[0-9.]+' | tail -1 | grep -oE '[0-9.]+$')"
+    down="$(awk -v b="${down:-0}" 'BEGIN{printf "%d", int(b/1000000+0.5)}')"
+  fi
+
+  log "  iperf3 upload vs ${IPERF3_SERVER} (${dur}s)"
+  if up_json="$(iperf3 -c "${IPERF3_SERVER}" -t "${dur}" -J 2>/dev/null)"; then
+    up="$(printf '%s' "${up_json}" | grep -oE '"bits_per_second"[[:space:]]*:[[:space:]]*[0-9.]+' | tail -1 | grep -oE '[0-9.]+$')"
+    up="$(awk -v b="${up:-0}" 'BEGIN{printf "%d", int(b/1000000+0.5)}')"
+  fi
+
+  if [[ -z "${up}" && -z "${down}" ]]; then
+    record_detect "iperf3" "" "" "failed against ${IPERF3_SERVER}"
+    return 0
+  fi
+  [[ "${up:-0}" -eq 0 ]] && up=""
+  [[ "${down:-0}" -eq 0 ]] && down=""
+  record_detect "iperf3" "${up}" "${down}" "server=${IPERF3_SERVER}"
+}
+
+# Optional remote bench: download to temp, run, parse Mbps-like numbers
+detect_bench(){
+  log "Method bench: remote script (${BENCH_URL})"
+
+  if [[ "${ALLOW_REMOTE_BENCH}" != "1" ]]; then
+    if is_tty; then
+      printf '[?] Run remote bench from %s ? This executes third-party code as root. [y/N] ' "${BENCH_URL}"
+      local ans=""
+      read -r ans || true
+      case "${ans}" in
+        y|Y|yes|YES) ;;
+        *)
+          record_detect "bench" "" "" "skipped: user declined remote bench"
+          return 0
+          ;;
+      esac
+    else
+      record_detect "bench" "" "" "skipped: set ALLOW_REMOTE_BENCH=1"
+      return 0
+    fi
+  fi
+
+  if ! have_bin curl && ! have_bin wget; then
+    record_detect "bench" "" "" "skipped: need curl or wget"
+    return 0
+  fi
+
+  local work dir script out
+  work="$(mktemp -d)"
+  script="${work}/bench.sh"
+  out="${work}/out.txt"
+
+  log "  fetching bench script to ${script}"
+  if have_bin curl; then
+    curl -fsSL --max-time 60 "${BENCH_URL}" -o "${script}" || {
+      rm -rf "${work}"
+      record_detect "bench" "" "" "download failed"
+      return 0
+    }
+  else
+    wget -q -O "${script}" --timeout=60 "${BENCH_URL}" || {
+      rm -rf "${work}"
+      record_detect "bench" "" "" "download failed"
+      return 0
+    }
+  fi
+
+  if [[ ! -s "${script}" ]]; then
+    rm -rf "${work}"
+    record_detect "bench" "" "" "empty script"
+    return 0
+  fi
+
+  chmod 0700 "${script}"
+  log "  running bench (may take several minutes, saturates link)..."
+  set +e
+  bash "${script}" >"${out}" 2>&1
+  set -e
+
+  # Parse common patterns: Download: xx.xx Mbps / 上行 / 下行 / Speed ...
+  local down up
+  down="$(grep -iE 'download|下行|接收' "${out}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)"
+  up="$(grep -iE 'upload|上行|发送' "${out}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)"
+
+  # Fallback: lines with Mbps
+  if [[ -z "${down}" ]]; then
+    down="$(grep -oiE '[0-9]+(\.[0-9]+)?[[:space:]]*Mbps' "${out}" 2>/dev/null | head -1 | grep -oE '[0-9]+(\.[0-9]+)?' || true)"
+  fi
+  if [[ -z "${up}" ]]; then
+    up="$(grep -oiE '[0-9]+(\.[0-9]+)?[[:space:]]*Mbps' "${out}" 2>/dev/null | sed -n '2p' | grep -oE '[0-9]+(\.[0-9]+)?' || true)"
+  fi
+
+  down="$(rate_to_mbit "${down}")"
+  up="$(rate_to_mbit "${up}")"
+
+  # Keep a short log snippet for user
+  if [[ -z "${up}" && -z "${down}" ]]; then
+    warn "bench finished but could not parse bandwidth; see ${work}/out.txt (kept 60s)"
+    ( sleep 60; rm -rf "${work}" ) &>/dev/null &
+    record_detect "bench" "" "" "parse failed (raw log retained briefly)"
+    return 0
+  fi
+
+  rm -rf "${work}"
+  record_detect "bench" "${up}" "${down}" "remote ${BENCH_URL}"
+}
+
+# Optional rough RTT → suggest CAKE_RTT if still default-ish
+suggest_rtt_from_ping(){
+  local host="${1:-1.1.1.1}"
+  if ! have_bin ping; then
+    return 0
+  fi
+  local out rtt
+  out="$(ping -c 4 -W 2 "${host}" 2>/dev/null || true)"
+  rtt="$(printf '%s' "${out}" | awk -F'/' '/rtt|round-trip/{print $5; exit}')"
+  if [[ -z "${rtt}" ]]; then
+    rtt="$(printf '%s' "${out}" | awk -F'=' '/time=/{gsub(/ ms/,""); print $NF}' | awk '{s+=$1;n++} END{if(n) print s/n}')"
+  fi
+  [[ -n "${rtt}" ]] || return 0
+  # map avg rtt to cake rtt with floor/ceil
+  local ms
+  ms="$(awk -v r="${rtt}" 'BEGIN{
+    m=int(r*1.5+0.5)
+    if (m<20) m=20
+    if (m>200) m=200
+    print m
+  }')"
+  printf '%sms' "${ms}"
+}
+
+run_all_detect_methods(){
+  DETECT_METHOD_NAMES=()
+  DETECT_UP_MBITS=()
+  DETECT_DOWN_MBITS=()
+  DETECT_NOTES=()
+
+  local methods="${DETECT_METHODS//,/ }"
+  local m
+  for m in ${methods}; do
+    m="$(printf '%s' "${m}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
+    case "${m}" in
+      http) detect_http ;;
+      speedtest|st) detect_speedtest ;;
+      iperf3|iperf) detect_iperf3 ;;
+      bench|benchsh) detect_bench ;;
+      "" ) ;;
+      *) warn "Unknown detect method: ${m}" ;;
+    esac
+  done
+}
+
+aggregate_peaks(){
+  PEAK_UP_MBIT=""
+  PEAK_DOWN_MBIT=""
+  local i n="${#DETECT_METHOD_NAMES[@]}"
+  local up down
+  local max_up=0 max_down=0 has_up=0 has_down=0
+
+  for ((i=0; i<n; i++)); do
+    up="${DETECT_UP_MBITS[i]:-}"
+    down="${DETECT_DOWN_MBITS[i]:-}"
+    if [[ -n "${up}" && "${up}" -gt 0 ]]; then
+      has_up=1
+      max_up="$(max_int "${max_up}" "${up}")"
+    fi
+    if [[ -n "${down}" && "${down}" -gt 0 ]]; then
+      has_down=1
+      max_down="$(max_int "${max_down}" "${down}")"
+    fi
+  done
+
+  [[ "${has_up}" -eq 1 ]] && PEAK_UP_MBIT="${max_up}"
+  [[ "${has_down}" -eq 1 ]] && PEAK_DOWN_MBIT="${max_down}"
+
+  # If only one direction measured, do not invent the other
+  SUGGEST_UP=""
+  SUGGEST_DOWN=""
+  [[ -n "${PEAK_UP_MBIT}" ]] && SUGGEST_UP="$(mbit_with_safety "${PEAK_UP_MBIT}")"
+  [[ -n "${PEAK_DOWN_MBIT}" ]] && SUGGEST_DOWN="$(mbit_with_safety "${PEAK_DOWN_MBIT}")"
+}
+
+print_detect_table(){
+  echo
+  echo "====== detect summary ======"
+  printf '%-12s  %-12s  %-12s  %s\n' "METHOD" "UP (Mbit)" "DOWN (Mbit)" "NOTE"
+  printf '%-12s  %-12s  %-12s  %s\n' "------------" "------------" "------------" "----"
+  local i n="${#DETECT_METHOD_NAMES[@]}"
+  for ((i=0; i<n; i++)); do
+    printf '%-12s  %-12s  %-12s  %s\n' \
+      "${DETECT_METHOD_NAMES[i]}" \
+      "${DETECT_UP_MBITS[i]:-n/a}" \
+      "${DETECT_DOWN_MBITS[i]:-n/a}" \
+      "${DETECT_NOTES[i]:-}"
+  done
+  echo
+  echo "Peak up:   ${PEAK_UP_MBIT:-n/a} Mbit"
+  echo "Peak down: ${PEAK_DOWN_MBIT:-n/a} Mbit"
+  echo "Safety:    × ${BANDWIDTH_SAFETY_FACTOR}"
+  echo "Suggest:   UP_RATE=${SUGGEST_UP:-unset}  DOWN_RATE=${SUGGEST_DOWN:-unset}"
+  echo
+  echo "Note: peaks are path/time-dependent estimates, not ISP contract rates."
+}
+
+save_detect_cache(){
+  mkdir -p "$(dirname "${DETECT_CACHE_FILE}")"
+  cat >"${DETECT_CACHE_FILE}" <<EOF
+# generated by bbr-cake-transit-exit detect $(date -Is 2>/dev/null || date)
+PEAK_UP_MBIT="${PEAK_UP_MBIT:-}"
+PEAK_DOWN_MBIT="${PEAK_DOWN_MBIT:-}"
+SUGGEST_UP="${SUGGEST_UP:-}"
+SUGGEST_DOWN="${SUGGEST_DOWN:-}"
+BANDWIDTH_SAFETY_FACTOR="${BANDWIDTH_SAFETY_FACTOR}"
+BANDWIDTH_SOURCE="detect"
+DETECT_METHODS="${DETECT_METHODS}"
+EOF
+  ok "Saved detect cache: ${DETECT_CACHE_FILE}"
+}
+
+load_detect_cache(){
+  [[ "${USE_DETECT_CACHE}" == "1" ]] || return 1
+  [[ -f "${DETECT_CACHE_FILE}" ]] || return 1
+  # shellcheck disable=SC1090
+  . "${DETECT_CACHE_FILE}"
+  [[ -n "${SUGGEST_UP:-}" || -n "${SUGGEST_DOWN:-}" ]] || return 1
+  return 0
+}
+
+confirm_peak_rates(){
+  # Sets BANDWIDTH_UP_DEFAULT, BANDWIDTH_DOWN_DEFAULT, ENABLE_LIMITS, BANDWIDTH_SOURCE
+  if [[ -z "${SUGGEST_UP:-}" && -z "${SUGGEST_DOWN:-}" ]]; then
+    warn "No usable peak rates from detect."
+    if [[ "${AUTO_CONFIRM_PEAK}" == "1" ]]; then
+      ENABLE_LIMITS=0
+      BANDWIDTH_SOURCE="none"
+      return 0
+    fi
+    if is_tty; then
+      printf '[?] No peaks found. Continue with unlimited CAKE (no hard limit)? [Y/n] '
+      local ans=""
+      read -r ans || true
+      case "${ans}" in
+        n|N|no|NO)
+          die "Aborted: no bandwidth rates."
+          ;;
+        *)
+          ENABLE_LIMITS=0
+          BANDWIDTH_SOURCE="none"
+          return 0
+          ;;
+      esac
+    else
+      ENABLE_LIMITS=0
+      BANDWIDTH_SOURCE="none"
+      return 0
+    fi
+  fi
+
+  local use_up="${SUGGEST_UP:-}"
+  local use_down="${SUGGEST_DOWN:-}"
+
+  if [[ "${AUTO_CONFIRM_PEAK}" == "1" ]]; then
+    log "AUTO_CONFIRM_PEAK=1 → accept suggest UP=${use_up:-none} DOWN=${use_down:-none}"
+  elif is_tty; then
+    echo
+    printf '[?] Accept suggested rates UP=%s DOWN=%s ?\n' "${use_up:-none}" "${use_down:-none}"
+    printf '    [Y] accept  [E] edit manually  [N] no limit (AQM only)  [Q] quit: '
+    local ans=""
+    read -r ans || true
+    case "${ans}" in
+      ""|y|Y|yes|YES) ;;
+      e|E)
+        printf '    UP_RATE (e.g. 90Mbit, empty=skip): '
+        read -r use_up || true
+        printf '    DOWN_RATE (e.g. 900Mbit, empty=skip): '
+        read -r use_down || true
+        ;;
+      n|N|no|NO)
+        ENABLE_LIMITS=0
+        BANDWIDTH_SOURCE="none"
+        BANDWIDTH_UP_DEFAULT=""
+        BANDWIDTH_DOWN_DEFAULT=""
+        ok "Will apply CAKE without hard bandwidth limits."
+        return 0
+        ;;
+      q|Q)
+        die "Aborted by user."
+        ;;
+      *)
+        warn "Unknown choice, accepting suggest."
+        ;;
+    esac
+  else
+    warn "Non-interactive shell: accepting suggested rates (set AUTO_CONFIRM_PEAK=1 to silence)."
+  fi
+
+  BANDWIDTH_UP_DEFAULT="${use_up}"
+  BANDWIDTH_DOWN_DEFAULT="${use_down}"
+  if [[ -n "${BANDWIDTH_UP_DEFAULT}" || -n "${BANDWIDTH_DOWN_DEFAULT}" ]]; then
+    ENABLE_LIMITS=1
+    BANDWIDTH_SOURCE="detect"
+  else
+    ENABLE_LIMITS=0
+    BANDWIDTH_SOURCE="none"
+  fi
+  # Asymmetric: if only one side set, still enable limits for that side in apply_qdisc
+  ok "Using UP_RATE=${BANDWIDTH_UP_DEFAULT:-unlimited} DOWN_RATE=${BANDWIDTH_DOWN_DEFAULT:-unlimited}"
+}
+
+resolve_bandwidth(){
+  # Priority: explicit rates → env file already loaded → cache → auto detect → unlimited
+  local cli_up="${OVERRIDE_UP_RATE:-${OVERRIDE_BANDWIDTH_UP_DEFAULT:-}}"
+  local cli_down="${OVERRIDE_DOWN_RATE:-${OVERRIDE_BANDWIDTH_DOWN_DEFAULT:-}}"
+
+  if [[ -n "${cli_up}" || -n "${cli_down}" ]]; then
+    BANDWIDTH_UP_DEFAULT="${cli_up:-${BANDWIDTH_UP_DEFAULT:-}}"
+    BANDWIDTH_DOWN_DEFAULT="${cli_down:-${BANDWIDTH_DOWN_DEFAULT:-}}"
+    ENABLE_LIMITS="${OVERRIDE_ENABLE_LIMITS:-1}"
+    BANDWIDTH_SOURCE="manual"
+    log "Bandwidth source: manual (UP=${BANDWIDTH_UP_DEFAULT:-unset} DOWN=${BANDWIDTH_DOWN_DEFAULT:-unset})"
+    return 0
+  fi
+
+  # Rates already in env file (from previous install)
+  if [[ -n "${BANDWIDTH_UP_DEFAULT}" || -n "${BANDWIDTH_DOWN_DEFAULT}" ]]; then
+    if [[ -z "${ENABLE_LIMITS}" ]]; then
+      ENABLE_LIMITS=1
+    fi
+    if [[ "${BANDWIDTH_SOURCE}" == "none" || -z "${BANDWIDTH_SOURCE}" ]]; then
+      BANDWIDTH_SOURCE="config"
+    fi
+    log "Bandwidth source: ${BANDWIDTH_SOURCE} (UP=${BANDWIDTH_UP_DEFAULT:-unset} DOWN=${BANDWIDTH_DOWN_DEFAULT:-unset})"
+    return 0
+  fi
+
+  if [[ "${AUTO_DETECT_BW}" == "1" ]]; then
+    log "AUTO_DETECT_BW=1 → running multi-method detect"
+    run_all_detect_methods
+    aggregate_peaks
+    print_detect_table
+    save_detect_cache
+    confirm_peak_rates
+    return 0
+  fi
+
+  if load_detect_cache; then
+    BANDWIDTH_UP_DEFAULT="${SUGGEST_UP:-}"
+    BANDWIDTH_DOWN_DEFAULT="${SUGGEST_DOWN:-}"
+    ENABLE_LIMITS="${OVERRIDE_ENABLE_LIMITS:-1}"
+    BANDWIDTH_SOURCE="detect-cache"
+    log "Bandwidth source: detect-cache (UP=${BANDWIDTH_UP_DEFAULT:-unset} DOWN=${BANDWIDTH_DOWN_DEFAULT:-unset})"
+    log "Re-run '$0 detect' to refresh peaks."
+    return 0
+  fi
+
+  # Safe default: no hardcode 285/950
+  if [[ -z "${ENABLE_LIMITS}" ]]; then
+    ENABLE_LIMITS=0
+  fi
+  if [[ "${ENABLE_LIMITS}" == "1" ]]; then
+    warn "ENABLE_LIMITS=1 but no UP/DOWN rates set; forcing unlimited to avoid wrong shape."
+    ENABLE_LIMITS=0
+  fi
+  BANDWIDTH_SOURCE="none"
+  warn "No bandwidth rates configured. Applying BBR+CAKE without hard limits."
+  warn "Tip: run '$0 detect' or set UP_RATE/DOWN_RATE before apply."
+}
+
+# Force non-interactive peak acceptance and fill BANDWIDTH_* from detect results
+accept_suggest_rates(){
+  AUTO_CONFIRM_PEAK=1
+  confirm_peak_rates
+  if [[ -n "${BANDWIDTH_UP_DEFAULT:-}" || -n "${BANDWIDTH_DOWN_DEFAULT:-}" ]]; then
+    mkdir -p "$(dirname "${DETECT_CACHE_FILE}")"
+    cat >"${DETECT_CACHE_FILE}" <<EOF
+# auto-filled $(date -Is 2>/dev/null || date)
+PEAK_UP_MBIT="${PEAK_UP_MBIT:-}"
+PEAK_DOWN_MBIT="${PEAK_DOWN_MBIT:-}"
+SUGGEST_UP="${BANDWIDTH_UP_DEFAULT:-}"
+SUGGEST_DOWN="${BANDWIDTH_DOWN_DEFAULT:-}"
+BANDWIDTH_SAFETY_FACTOR="${BANDWIDTH_SAFETY_FACTOR}"
+BANDWIDTH_SOURCE="detect"
+DETECT_METHODS="${DETECT_METHODS}"
+EOF
+  fi
+}
+
+# Optional: auto-tune CAKE_RTT from ping if user did not override
+maybe_auto_rtt(){
+  [[ -z "${OVERRIDE_CAKE_RTT}" ]] || return 0
+  local rtt_s
+  rtt_s="$(suggest_rtt_from_ping 1.1.1.1 || true)"
+  if [[ -n "${rtt_s}" ]]; then
+    CAKE_RTT="${rtt_s}"
+    log "Auto CAKE_RTT from ping hint: ${CAKE_RTT}"
+  fi
+}
+
+run_detect_pipeline(){
+  echo "====== auto bandwidth detect v${VERSION} ======"
+  echo "Methods: ${DETECT_METHODS}"
+  echo "Safety factor: ${BANDWIDTH_SAFETY_FACTOR}"
+  echo "Non-interactive: peaks × factor will be filled automatically."
+  echo "This will saturate the link for a while."
+  echo
+
+  run_all_detect_methods
+  aggregate_peaks
+  print_detect_table
+  maybe_auto_rtt
+
+  if [[ -z "${PEAK_UP_MBIT:-}" && -z "${PEAK_DOWN_MBIT:-}" ]]; then
+    warn "All detect methods failed or were skipped."
+    warn "Will apply BBR+CAKE without hard bandwidth limits."
+    ENABLE_LIMITS=0
+    BANDWIDTH_SOURCE="none"
+    BANDWIDTH_UP_DEFAULT=""
+    BANDWIDTH_DOWN_DEFAULT=""
+    return 0
+  fi
+
+  # If only one direction measured, mirror the other for shaping usability on 中转
+  # (better than leaving empty; user can override with UP_RATE/DOWN_RATE)
+  if [[ -n "${PEAK_DOWN_MBIT:-}" && -z "${PEAK_UP_MBIT:-}" ]]; then
+    PEAK_UP_MBIT="${PEAK_DOWN_MBIT}"
+    log "Only down measured → mirror peak up=${PEAK_UP_MBIT} Mbit for CAKE egress"
+  fi
+  if [[ -n "${PEAK_UP_MBIT:-}" && -z "${PEAK_DOWN_MBIT:-}" ]]; then
+    PEAK_DOWN_MBIT="${PEAK_UP_MBIT}"
+    log "Only up measured → mirror peak down=${PEAK_DOWN_MBIT} Mbit for CAKE ingress"
+  fi
+  SUGGEST_UP="$(mbit_with_safety "${PEAK_UP_MBIT}")"
+  SUGGEST_DOWN="$(mbit_with_safety "${PEAK_DOWN_MBIT}")"
+  echo "Final suggest after mirror: UP=${SUGGEST_UP} DOWN=${SUGGEST_DOWN}"
+
+  save_detect_cache
+  accept_suggest_rates
+}
+
+persist_install(){
+  install_self
+  write_env_file
+  write_service_file
+
+  if have_bin systemctl; then
+    systemctl daemon-reload
+    systemctl enable "${SERVICE_NAME}" >/dev/null
+    # apply already done; just enable for reboot — restart would re-apply
+    systemctl restart "${SERVICE_NAME}" || true
+    ok "Installed and enabled ${SERVICE_NAME}."
+  else
+    warn "systemctl not found; files written but service not enabled."
+  fi
+  echo "[CONFIG] ${ENV_FILE}"
+  echo "[SCRIPT] ${INSTALL_PATH}"
+  echo "[SERVICE] ${SERVICE_FILE}"
+  echo "[BW] source=${BANDWIDTH_SOURCE} UP=${BANDWIDTH_UP_DEFAULT:-none} DOWN=${BANDWIDTH_DOWN_DEFAULT:-none} limits=${ENABLE_LIMITS}"
+}
+
+# One-shot: detect → auto-fill → apply → install (default entry)
+auto_cmd(){
   require_root
   load_overrides
   preflight
+
+  # Fully automatic: no prompts
+  AUTO_CONFIRM_PEAK=1
+  # Enable remote bench in auto unless user explicitly set ALLOW_REMOTE_BENCH=0
+  if [[ -z "${OVERRIDE_ALLOW_REMOTE_BENCH}" ]]; then
+    ALLOW_REMOTE_BENCH=1
+  fi
+
+  echo "=============================================="
+  echo " BBR+CAKE 中转一键调优 v${VERSION}"
+  echo " 测速 → 自动填带宽 → 应用 → 持久化"
+  echo "=============================================="
+  echo
+
+  local has_cli_rates=0
+  if [[ -n "${OVERRIDE_UP_RATE:-}" || -n "${OVERRIDE_DOWN_RATE:-}" || \
+        -n "${OVERRIDE_BANDWIDTH_UP_DEFAULT:-}" || -n "${OVERRIDE_BANDWIDTH_DOWN_DEFAULT:-}" ]]; then
+    has_cli_rates=1
+  fi
+
+  if [[ "${SKIP_DETECT}" == "1" || "${has_cli_rates}" -eq 1 ]]; then
+    if [[ "${has_cli_rates}" -eq 1 ]]; then
+      BANDWIDTH_UP_DEFAULT="${OVERRIDE_UP_RATE:-${OVERRIDE_BANDWIDTH_UP_DEFAULT:-${BANDWIDTH_UP_DEFAULT:-}}}"
+      BANDWIDTH_DOWN_DEFAULT="${OVERRIDE_DOWN_RATE:-${OVERRIDE_BANDWIDTH_DOWN_DEFAULT:-${BANDWIDTH_DOWN_DEFAULT:-}}}"
+      ENABLE_LIMITS="${OVERRIDE_ENABLE_LIMITS:-1}"
+      BANDWIDTH_SOURCE="manual"
+      log "Skip detect: using manual rates UP=${BANDWIDTH_UP_DEFAULT:-unset} DOWN=${BANDWIDTH_DOWN_DEFAULT:-unset}"
+    else
+      # SKIP_DETECT without rates: use env file / cache
+      resolve_bandwidth
+    fi
+  else
+    # Always fresh detect on auto (ignore old config rates so re-run retunes)
+    BANDWIDTH_UP_DEFAULT=""
+    BANDWIDTH_DOWN_DEFAULT=""
+    run_detect_pipeline
+  fi
+
+  log "Applying BBR + CAKE ..."
   write_sysctl
   detect_cake_nat
   discover_candidates
@@ -426,16 +1245,112 @@ apply_cmd(){
   apply_mss
   show_qdisc_status
   echo
-  ok "Applied BBR + CAKE transit/exit shared-node profile."
+  ok "Applied (source=${BANDWIDTH_SOURCE}, limits=${ENABLE_LIMITS}, UP=${BANDWIDTH_UP_DEFAULT:-none}, DOWN=${BANDWIDTH_DOWN_DEFAULT:-none})."
+
+  if [[ "${AUTO_INSTALL}" == "1" ]]; then
+    log "Persisting via install ..."
+    persist_install
+  else
+    warn "AUTO_INSTALL=0 → not writing systemd unit. Reboot will lose tc rules."
+    echo "[NOTE] Run: $0 install   later if needed."
+  fi
+
+  echo
+  ok "一键调优完成。"
+  echo "查看: $0 status"
+  echo "卸载: $0 uninstall"
+}
+
+detect_cmd(){
+  # Prefer not requiring full tc preflight for detect-only, but root helps for clean tests
+  if [[ ${EUID} -ne 0 ]]; then
+    warn "Not root: some methods may be less accurate; prefer sudo."
+  fi
+
+  echo "====== bandwidth detect v${VERSION} ======"
+  echo "Methods: ${DETECT_METHODS}"
+  echo "Safety factor: ${BANDWIDTH_SAFETY_FACTOR}"
+  echo "This will saturate the link for a while. Prefer off-peak on production nodes."
+  echo
+
+  if is_tty && [[ "${AUTO_CONFIRM_PEAK}" != "1" ]]; then
+    printf '[?] Start multi-method speed tests now? [Y/n] '
+    local ans=""
+    read -r ans || true
+    case "${ans}" in
+      n|N|no|NO) die "Detect cancelled." ;;
+    esac
+  fi
+
+  # interactive detect: do not force bench unless allowed
+  run_all_detect_methods
+  aggregate_peaks
+  print_detect_table
+
+  local rtt_s
+  rtt_s="$(suggest_rtt_from_ping 1.1.1.1 || true)"
+  if [[ -n "${rtt_s}" ]]; then
+    log "Optional CAKE_RTT hint from ping: ${rtt_s} (current ${CAKE_RTT})"
+  fi
+
+  if [[ -z "${PEAK_UP_MBIT:-}" && -z "${PEAK_DOWN_MBIT:-}" ]]; then
+    warn "All methods failed or were skipped. Install speedtest-cli / set IPERF3_SERVER / fix HTTP URLs."
+    exit 2
+  fi
+
+  save_detect_cache
+
+  if [[ "${AUTO_CONFIRM_PEAK}" == "1" ]]; then
+    accept_suggest_rates
+  elif is_tty; then
+    confirm_peak_rates
+    if [[ "${BANDWIDTH_SOURCE}" == "detect" ]]; then
+      SUGGEST_UP="${BANDWIDTH_UP_DEFAULT}"
+      SUGGEST_DOWN="${BANDWIDTH_DOWN_DEFAULT}"
+      PEAK_UP_MBIT="$(rate_to_mbit "${BANDWIDTH_UP_DEFAULT}")"
+      PEAK_DOWN_MBIT="$(rate_to_mbit "${BANDWIDTH_DOWN_DEFAULT}")"
+      mkdir -p "$(dirname "${DETECT_CACHE_FILE}")"
+      cat >"${DETECT_CACHE_FILE}" <<EOF
+# confirmed by user $(date -Is 2>/dev/null || date)
+PEAK_UP_MBIT="${PEAK_UP_MBIT:-}"
+PEAK_DOWN_MBIT="${PEAK_DOWN_MBIT:-}"
+SUGGEST_UP="${BANDWIDTH_UP_DEFAULT:-}"
+SUGGEST_DOWN="${BANDWIDTH_DOWN_DEFAULT:-}"
+BANDWIDTH_SAFETY_FACTOR="${BANDWIDTH_SAFETY_FACTOR}"
+BANDWIDTH_SOURCE="detect"
+DETECT_METHODS="${DETECT_METHODS}"
+EOF
+    fi
+  fi
+
+  echo
+  ok "Detect done. 一键应用+安装请执行: $0 auto"
+  echo "  或: UP_RATE=${BANDWIDTH_UP_DEFAULT:-${SUGGEST_UP:-}} DOWN_RATE=${BANDWIDTH_DOWN_DEFAULT:-${SUGGEST_DOWN:-}} $0 apply"
+}
+
+apply_cmd(){
+  require_root
+  load_overrides
+  preflight
+  resolve_bandwidth
+  write_sysctl
+  detect_cake_nat
+  discover_candidates
+  apply_qdisc
+  apply_mss
+  show_qdisc_status
+  echo
+  ok "Applied BBR + CAKE profile (source=${BANDWIDTH_SOURCE}, limits=${ENABLE_LIMITS})."
   echo "[NOTE] Use '$0 install' to make tc qdisc and MSS rules persistent across reboot."
+  echo "[NOTE] Or one-shot retune: $0 auto"
 }
 
 write_env_file(){
   mkdir -p "$(dirname "${ENV_FILE}")"
   cat >"${ENV_FILE}" <<EOF
-ENABLE_LIMITS="${ENABLE_LIMITS}"
-UP_RATE="${BANDWIDTH_UP_DEFAULT}"
-DOWN_RATE="${BANDWIDTH_DOWN_DEFAULT}"
+ENABLE_LIMITS="${ENABLE_LIMITS:-0}"
+UP_RATE="${BANDWIDTH_UP_DEFAULT:-}"
+DOWN_RATE="${BANDWIDTH_DOWN_DEFAULT:-}"
 CAKE_RTT="${CAKE_RTT}"
 BASE_CAKE_OPTS="${BASE_CAKE_OPTS}"
 ENABLE_FORWARDING="${ENABLE_FORWARDING}"
@@ -450,6 +1365,16 @@ MSS_CLAMP_HOST_OUTPUT="${MSS_CLAMP_HOST_OUTPUT}"
 DISABLE_GRO_GSO_ON_VPN="${DISABLE_GRO_GSO_ON_VPN}"
 UP_OVERRIDES="${UP_OVERRIDES}"
 DOWN_OVERRIDES="${DOWN_OVERRIDES}"
+BANDWIDTH_SOURCE="${BANDWIDTH_SOURCE:-none}"
+BANDWIDTH_SAFETY_FACTOR="${BANDWIDTH_SAFETY_FACTOR}"
+DETECT_METHODS="${DETECT_METHODS}"
+IPERF3_SERVER="${IPERF3_SERVER}"
+IPERF3_DURATION="${IPERF3_DURATION}"
+ALLOW_REMOTE_BENCH="${ALLOW_REMOTE_BENCH}"
+BENCH_URL="${BENCH_URL}"
+HTTP_TEST_URLS="${HTTP_TEST_URLS}"
+PROFILE="${PROFILE}"
+USE_DETECT_CACHE="${USE_DETECT_CACHE}"
 SCRIPT_URL="${SCRIPT_URL}"
 EOF
 }
@@ -458,15 +1383,15 @@ install_self(){
   mkdir -p "$(dirname "${INSTALL_PATH}")"
 
   local self="${BASH_SOURCE[0]:-$0}"
-  if [[ -r "${self}" && "${self}" != "bash" ]]; then
+  if [[ -r "${self}" && "${self}" != "bash" && "${self}" != "-bash" && "${self}" != "/dev/stdin" ]]; then
     install -m 0755 "${self}" "${INSTALL_PATH}"
     return 0
   fi
 
   log "Installing from ${SCRIPT_URL}"
-  if command -v curl >/dev/null 2>&1; then
+  if have_bin curl; then
     curl -fsSL "${SCRIPT_URL}" -o "${INSTALL_PATH}"
-  elif command -v wget >/dev/null 2>&1; then
+  elif have_bin wget; then
     wget -qO "${INSTALL_PATH}" "${SCRIPT_URL}"
   else
     die "Need curl or wget to install when running from stdin."
@@ -499,6 +1424,7 @@ install_cmd(){
   require_root
   load_overrides
   preflight
+  resolve_bandwidth
   install_self
   write_env_file
   write_service_file
@@ -511,6 +1437,7 @@ install_cmd(){
   echo "[CONFIG] ${ENV_FILE}"
   echo "[SCRIPT] ${INSTALL_PATH}"
   echo "[SERVICE] ${SERVICE_FILE}"
+  echo "[BW] source=${BANDWIDTH_SOURCE} UP=${BANDWIDTH_UP_DEFAULT:-none} DOWN=${BANDWIDTH_DOWN_DEFAULT:-none} limits=${ENABLE_LIMITS}"
 }
 
 cleanup_runtime(){
@@ -536,7 +1463,7 @@ cleanup_runtime(){
 uninstall_cmd(){
   require_root
 
-  if command -v systemctl >/dev/null 2>&1 && [[ -f "${SERVICE_FILE}" ]]; then
+  if have_bin systemctl && [[ -f "${SERVICE_FILE}" ]]; then
     systemctl stop "${SERVICE_NAME}" 2>/dev/null || true
     systemctl disable "${SERVICE_NAME}" >/dev/null 2>&1 || true
   else
@@ -544,8 +1471,10 @@ uninstall_cmd(){
   fi
 
   rm -f "${SERVICE_FILE}" "${ENV_FILE}" "${SYSCTL_FILE}" "${INSTALL_PATH}"
+  rm -f "${DETECT_CACHE_FILE}"
+  rmdir "$(dirname "${DETECT_CACHE_FILE}")" 2>/dev/null || true
 
-  if command -v systemctl >/dev/null 2>&1; then
+  if have_bin systemctl; then
     systemctl daemon-reload
   fi
 
@@ -554,15 +1483,34 @@ uninstall_cmd(){
 }
 
 status_cmd(){
+  echo "====== version ======"
+  echo "v${VERSION}"
+
+  echo
   echo "====== sysctl ======"
   sysctl net.ipv4.tcp_congestion_control 2>/dev/null || true
   sysctl net.core.default_qdisc 2>/dev/null || true
   sysctl net.ipv4.ip_forward 2>/dev/null || true
   sysctl net.ipv6.conf.all.forwarding 2>/dev/null || true
+  sysctl net.ipv4.conf.all.rp_filter 2>/dev/null || true
+
+  echo
+  echo "====== bandwidth config ======"
+  if [[ -f "${ENV_FILE}" ]]; then
+    grep -E '^(ENABLE_LIMITS|UP_RATE|DOWN_RATE|BANDWIDTH_SOURCE|CAKE_RTT|PROFILE)=' "${ENV_FILE}" 2>/dev/null || true
+  else
+    echo "No ${ENV_FILE}"
+  fi
+  if [[ -f "${DETECT_CACHE_FILE}" ]]; then
+    echo "--- detect cache ---"
+    cat "${DETECT_CACHE_FILE}"
+  else
+    echo "No detect cache"
+  fi
 
   echo
   echo "====== service ======"
-  if command -v systemctl >/dev/null 2>&1; then
+  if have_bin systemctl; then
     systemctl is-enabled "${SERVICE_NAME}" 2>/dev/null || true
     systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true
   else
@@ -570,25 +1518,33 @@ status_cmd(){
   fi
 
   load_overrides
-  if command -v ip >/dev/null 2>&1 && command -v tc >/dev/null 2>&1; then
-    discover_candidates
-    show_qdisc_status
+  if have_bin ip && have_bin tc; then
+    if discover_candidates 2>/dev/null; then
+      show_qdisc_status
+    fi
   fi
 
   echo
   echo "====== MSS rules ======"
-  if command -v iptables >/dev/null 2>&1; then
+  if have_bin iptables; then
     iptables -t mangle -S 2>/dev/null | grep TCPMSS || true
   fi
-  if command -v ip6tables >/dev/null 2>&1; then
+  if have_bin ip6tables; then
     ip6tables -t mangle -S 2>/dev/null | grep TCPMSS || true
   fi
 }
 
 main(){
-  local cmd="${1:-apply}"
+  # Default: full auto (detect → fill → apply → install)
+  local cmd="${1:-auto}"
 
   case "${cmd}" in
+    auto|"")
+      auto_cmd
+      ;;
+    detect)
+      detect_cmd
+      ;;
     apply)
       apply_cmd
       ;;
@@ -607,6 +1563,9 @@ main(){
       ;;
     -h|--help|help)
       usage
+      ;;
+    -v|--version|version)
+      echo "v${VERSION}"
       ;;
     *)
       usage
