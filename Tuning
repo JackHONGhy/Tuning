@@ -13,11 +13,10 @@
 # Pipe:
 #   wget -qO- https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning | sudo bash
 set -euo pipefail
-# Propagate ERR into functions; print real failure line (fixes "silent exit" at preflight)
-set -E
-trap 'rc=$?; printf "[ERROR] 脚本异常退出 code=%s line=%s cmd=%s\n" "$rc" "${LINENO}" "${BASH_COMMAND}" >&2' ERR
+# NOTE: do NOT use set -E + ERR trap on [[ ]] && chains — bash fires ERR when
+# [[ condition ]] is false (e.g. empty detail in progress_set), aborting install.
 
-VERSION="3.3.2"
+VERSION="3.3.3"
 INSTALL_PATH="/usr/local/sbin/bbr-cake-transit-exit"
 SERVICE_NAME="bbr-cake-transit-exit.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
@@ -332,7 +331,9 @@ progress_set(){
     echo "pid=$$"
   } >"${PROGRESS_FILE}" 2>/dev/null || true
   phase "${cur}" "${total}" "${title}"
-  [[ -n "${detail}" ]] && log "${detail}"
+  if [[ -n "${detail:-}" ]]; then
+    log "${detail}"
+  fi
 }
 
 progress_done(){
@@ -2681,8 +2682,6 @@ status_cmd(){
 selfcheck_cmd(){
   echo "====== selfcheck v${VERSION} ======"
   local fail=0
-  # Avoid ERR trap noise on expected non-zero checks
-  set +E
   echo "kernel: $(uname -r 2>/dev/null || echo unknown)"
   echo "uid: ${EUID}"
   for b in ip tc sysctl awk grep sed; do
@@ -2725,7 +2724,6 @@ selfcheck_cmd(){
   local t
   t="$(normalize_cake_rate 100)"
   if [[ "${t}" == "100Mbit" ]]; then ok "normalize 100→100Mbit"; else warn "normalize failed: ${t}"; fail=1; fi
-  set -E
   if [[ "${fail}" -eq 0 ]]; then
     ok "selfcheck PASSED — 可执行: sudo bash $0"
     return 0
