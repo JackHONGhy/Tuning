@@ -1,4 +1,4 @@
-# BBR + CAKE 中转服务器一键调优 v3.3
+# BBR + CAKE 中转服务器一键调优 v3.3.1
 
 面向 **Linux 中转 / 出口 / 共享节点** 的生产向网络调优脚本。  
 **推荐环境：Debian / Ubuntu**（其它带 systemd + iproute2 的 Linux 一般也可用）。
@@ -7,14 +7,22 @@
 
 ## 一键安装（Debian / Ubuntu）
 
-以 **root** 在服务器上执行（会测速，建议业务低峰）：
+以 **root** 在服务器上执行（会测速，建议业务低峰）。  
+**推荐先下载再执行**（比管道更稳，避免 stdin 被占、中途断流）：
+
+```bash
+wget -qO /tmp/Tuning https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning && sudo bash /tmp/Tuning
+```
+
+等价管道写法（一般也可用）：
 
 ```bash
 wget -qO- https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning | sudo bash
 ```
 
 > 极简系统若无 `wget`：先执行 `apt-get update && apt-get install -y wget`  
-> 需要 root、内核 ≥ 5.4、支持 `sch_cake` / `ifb`。
+> 需要 root、内核 ≥ 5.4、支持 `sch_cake` / `ifb`。  
+> 若卡在「阶段 1/5」：看是否出现 `[ERROR]`；可先 `sudo bash /tmp/Tuning selfcheck`。
 
 ### 自动完成
 
