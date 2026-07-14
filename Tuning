@@ -13,8 +13,11 @@
 # Local file:
 #   sudo bash Tuning
 set -euo pipefail
+# Propagate ERR into functions; print real failure line (fixes "silent exit")
+set -E
+trap 'rc=$?; printf "[ERROR] 脚本异常退出 code=%s line=%s cmd=%s\n" "$rc" "${LINENO}" "${BASH_COMMAND}" >&2' ERR
 
-VERSION="3.3.0"
+VERSION="3.3.1"
 INSTALL_PATH="/usr/local/sbin/bbr-cake-transit-exit"
 SERVICE_NAME="bbr-cake-transit-exit.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
@@ -399,12 +402,16 @@ usage(){
   cat <<EOF
 BBR + CAKE 中转调优 v${VERSION} (Transit Production)
 
-一键安装（Debian/Ubuntu 推荐）:
+一键安装（Debian/Ubuntu 推荐，先下载更稳）:
+  wget -qO /tmp/Tuning https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning && sudo bash /tmp/Tuning
+
+管道写法:
   wget -qO- https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning | sudo bash
 
 本地文件:
   sudo bash $0
   sudo bash $0 auto
+  sudo bash $0 selfcheck
 
 流程:
   多轮测速(默认2轮) → ${AGGREGATE_MODE:-median}聚合 → ×安全系数
@@ -913,34 +920,59 @@ load_overrides(){
 }
 
 preflight(){
+  # </dev/null: 避免 wget|bash 时子进程误读脚本 stdin
+  log "preflight: 检查依赖命令..."
   need_bin ip
   need_bin tc
   need_bin sysctl
   need_bin awk
   need_bin grep
   need_bin sed
+  ok "依赖命令齐全 (ip/tc/sysctl/awk/grep/sed)"
 
+  log "preflight: 加载内核模块 (bbr/cake/ifb)..."
   if have_bin modprobe; then
-    modprobe tcp_bbr 2>/dev/null || true
+    modprobe tcp_bbr </dev/null 2>/dev/null || true
     for module in sch_cake ifb cls_matchall act_mirred; do
-      modprobe "${module}" 2>/dev/null || true
+      modprobe "${module}" </dev/null 2>/dev/null || true
     done
   fi
 
   local available_cc
-  available_cc="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+  available_cc="$(sysctl -n net.ipv4.tcp_available_congestion_control </dev/null 2>/dev/null || true)"
+  log "可用拥塞控制: ${available_cc:-unknown}"
   if ! printf '%s\n' "${available_cc}" | grep -qw bbr; then
-    die "BBR is not available in this kernel. Available congestion controls: ${available_cc:-unknown}"
+    die "BBR 不可用。当前: ${available_cc:-unknown}。请换较新内核或开启 BBR。"
   fi
+  ok "BBR 可用"
 
-  # cake qdisc must exist (else apply will fail later)
-  if ! tc qdisc add dev lo root handle 1: cake 2>/dev/null; then
-    # try replace in case leftover
-    if ! tc qdisc replace dev lo root cake 2>/dev/null; then
-      die "tc cake qdisc unavailable (need sch_cake). Install iproute2 and kernel module sch_cake."
+  # 检测 cake：优先不破坏 lo；失败再尝试 attach lo；仍失败则硬退出
+  log "preflight: 检测 sch_cake..."
+  local cake_ok=0
+  if tc qdisc replace dev lo root handle 1: cake </dev/null 2>/dev/null; then
+    tc qdisc del dev lo root </dev/null 2>/dev/null || true
+    cake_ok=1
+  elif tc qdisc add dev lo root handle 1: cake </dev/null 2>/dev/null; then
+    tc qdisc del dev lo root </dev/null 2>/dev/null || true
+    cake_ok=1
+  elif have_bin modinfo && modinfo sch_cake </dev/null >/dev/null 2>&1; then
+    # 模块在但 lo 可能被占用/策略限制：再试一次 replace
+    if tc qdisc replace dev lo root cake </dev/null 2>/dev/null; then
+      tc qdisc del dev lo root </dev/null 2>/dev/null || true
+      cake_ok=1
     fi
   fi
-  tc qdisc del dev lo root 2>/dev/null || true
+  if [[ "${cake_ok}" -ne 1 ]]; then
+    # 最后手段：看 tc 是否认识 cake
+    if tc qdisc help 2>&1 | grep -qi cake; then
+      warn "tc 认识 cake，但无法在 lo 上挂载；将在真实网卡 apply 时再试"
+      cake_ok=1
+    fi
+  fi
+  if [[ "${cake_ok}" -ne 1 ]]; then
+    die "sch_cake 不可用。Debian/Ubuntu 可试: apt-get install -y iproute2 && modprobe sch_cake"
+  fi
+  ok "sch_cake 检测通过"
 
   # Normalize global rates early (user may pass bare numbers)
   if [[ -n "${BANDWIDTH_UP_DEFAULT:-}" ]]; then
@@ -949,11 +981,12 @@ preflight(){
   if [[ -n "${BANDWIDTH_DOWN_DEFAULT:-}" ]]; then
     BANDWIDTH_DOWN_DEFAULT="$(normalize_cake_rate "${BANDWIDTH_DOWN_DEFAULT}")"
   fi
-  CAKE_RTT="$(printf '%s' "${CAKE_RTT}" | tr -d '[:space:]')"
-  [[ "${CAKE_RTT}" =~ ^[0-9]+(\.[0-9]+)?ms$ || "${CAKE_RTT}" =~ ^[0-9]+(\.[0-9]+)?s$ ]] || {
-    warn "CAKE_RTT='${CAKE_RTT}' looks odd; using 50ms"
+  CAKE_RTT="$(printf '%s' "${CAKE_RTT:-50ms}" | tr -d '[:space:]')"
+  if ! [[ "${CAKE_RTT}" =~ ^[0-9]+([.][0-9]+)?ms$ || "${CAKE_RTT}" =~ ^[0-9]+([.][0-9]+)?s$ ]]; then
+    warn "CAKE_RTT='${CAKE_RTT}' 非法，改用 50ms"
     CAKE_RTT="50ms"
-  }
+  fi
+  ok "preflight 完成 (CAKE_RTT=${CAKE_RTT})"
 }
 
 write_sysctl(){
@@ -2100,8 +2133,10 @@ auto_cmd(){
   echo
 
   progress_set 1 5 "环境检查 + 地区识别"
+  log "开始 preflight（若此处退出会打印 [ERROR] 行号）..."
   preflight
-  resolve_region_tuning
+  log "开始地区识别 REGION=${REGION} GEO_DETECT=${GEO_DETECT}..."
+  resolve_region_tuning || warn "地区识别返回非零，继续使用当前参数"
   ok "环境检查通过 profile=${REGION_PROFILE:-?} RTT=${CAKE_RTT} safety=${BANDWIDTH_SAFETY_FACTOR}"
 
   local has_cli_rates=0
