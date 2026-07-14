@@ -8,16 +8,16 @@
 # Commands: auto (default), detect, apply, install, status, cleanup, uninstall, help
 # Requirements: Linux kernel >= 5.4, iproute2 tc, sch_cake/ifb support.
 #
-# One-shot on Debian/Ubuntu:
+# One-shot on Debian/Ubuntu (推荐先下载再执行，更稳):
+#   wget -qO /tmp/Tuning https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning && sudo bash /tmp/Tuning
+# Pipe:
 #   wget -qO- https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning | sudo bash
-# Local file:
-#   sudo bash Tuning
 set -euo pipefail
-# Propagate ERR into functions; print real failure line (fixes "silent exit")
+# Propagate ERR into functions; print real failure line (fixes "silent exit" at preflight)
 set -E
 trap 'rc=$?; printf "[ERROR] 脚本异常退出 code=%s line=%s cmd=%s\n" "$rc" "${LINENO}" "${BASH_COMMAND}" >&2' ERR
 
-VERSION="3.3.1"
+VERSION="3.3.2"
 INSTALL_PATH="/usr/local/sbin/bbr-cake-transit-exit"
 SERVICE_NAME="bbr-cake-transit-exit.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
@@ -2681,21 +2681,23 @@ status_cmd(){
 selfcheck_cmd(){
   echo "====== selfcheck v${VERSION} ======"
   local fail=0
+  # Avoid ERR trap noise on expected non-zero checks
+  set +E
   echo "kernel: $(uname -r 2>/dev/null || echo unknown)"
   echo "uid: ${EUID}"
   for b in ip tc sysctl awk grep sed; do
     if have_bin "${b}"; then ok "bin ${b}"; else warn "missing ${b}"; fail=1; fi
   done
   if have_bin modprobe; then
-    modprobe tcp_bbr 2>/dev/null || true
-    modprobe sch_cake 2>/dev/null || true
+    modprobe tcp_bbr </dev/null 2>/dev/null || true
+    modprobe sch_cake </dev/null 2>/dev/null || true
   fi
   local cc
-  cc="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+  cc="$(sysctl -n net.ipv4.tcp_available_congestion_control </dev/null 2>/dev/null || true)"
   if printf '%s' "${cc}" | grep -qw bbr; then ok "BBR available (${cc})"; else warn "BBR missing"; fail=1; fi
-  if tc qdisc replace dev lo root cake 2>/dev/null; then
+  if tc qdisc replace dev lo root cake </dev/null 2>/dev/null; then
     ok "sch_cake works on lo"
-    tc qdisc del dev lo root 2>/dev/null || true
+    tc qdisc del dev lo root </dev/null 2>/dev/null || true
   else
     warn "sch_cake not working"
     fail=1
@@ -2705,15 +2707,27 @@ selfcheck_cmd(){
   echo "safety=${BANDWIDTH_SAFETY_FACTOR} aggregate=${AGGREGATE_MODE}"
   if [[ -f "${ENV_FILE}" ]]; then ok "env ${ENV_FILE}"; else log "no env yet (not installed)"; fi
   if have_bin systemctl; then
-    systemctl is-enabled "${SERVICE_NAME}" 2>/dev/null || log "service not enabled"
-    systemctl is-enabled "${RETUNE_TIMER_NAME}" 2>/dev/null || log "retune timer not enabled"
+    if systemctl cat "${SERVICE_NAME}" &>/dev/null; then
+      local en
+      en="$(systemctl is-enabled "${SERVICE_NAME}" 2>/dev/null || echo disabled)"
+      ok "service unit present (enabled=${en})"
+    else
+      log "service not installed yet (run full install to create)"
+    fi
+    if systemctl cat "${RETUNE_TIMER_NAME}" &>/dev/null; then
+      local ten
+      ten="$(systemctl is-enabled "${RETUNE_TIMER_NAME}" 2>/dev/null || echo disabled)"
+      ok "retune timer present (enabled=${ten})"
+    else
+      log "retune timer not installed yet"
+    fi
   fi
-  # rate parser smoke
   local t
   t="$(normalize_cake_rate 100)"
-  [[ "${t}" == "100Mbit" ]] && ok "normalize 100→100Mbit" || { warn "normalize failed: ${t}"; fail=1; }
+  if [[ "${t}" == "100Mbit" ]]; then ok "normalize 100→100Mbit"; else warn "normalize failed: ${t}"; fail=1; fi
+  set -E
   if [[ "${fail}" -eq 0 ]]; then
-    ok "selfcheck PASSED"
+    ok "selfcheck PASSED — 可执行: sudo bash $0"
     return 0
   fi
   warn "selfcheck found issues (exit 1)"
