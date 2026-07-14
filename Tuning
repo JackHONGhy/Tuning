@@ -14,7 +14,7 @@
 #   sudo bash Tuning
 set -euo pipefail
 
-VERSION="3.1.0"
+VERSION="3.2.0"
 INSTALL_PATH="/usr/local/sbin/bbr-cake-transit-exit"
 SERVICE_NAME="bbr-cake-transit-exit.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
@@ -24,11 +24,20 @@ RETUNE_TIMER_NAME="bbr-cake-transit-exit-retune.timer"
 RETUNE_TIMER_FILE="/etc/systemd/system/${RETUNE_TIMER_NAME}"
 ENV_FILE="/etc/default/bbr-cake-transit-exit"
 SYSCTL_FILE="/etc/sysctl.d/99-bbr-cake-transit-exit.conf"
-DETECT_CACHE_FILE="/var/cache/bbr-cake-transit-exit/last-detect.env"
-PROGRESS_FILE="/var/cache/bbr-cake-transit-exit/progress.txt"
+CACHE_DIR="/var/cache/bbr-cake-transit-exit"
+DETECT_CACHE_FILE="${CACHE_DIR}/last-detect.env"
+PROGRESS_FILE="${CACHE_DIR}/progress.txt"
+BENCH_FAIL_SNIPPET="${CACHE_DIR}/bench-last-fail.txt"
 RETUNE_LOG_DIR="/var/log/bbr-cake-transit-exit"
 RETUNE_LOG_FILE="${RETUNE_LOG_DIR}/retune.log"
+# Max retune log size before truncate (bytes); keep tail
+RETUNE_LOG_MAX_BYTES="${RETUNE_LOG_MAX_BYTES:-2097152}"
 SCRIPT_URL="${SCRIPT_URL:-https://raw.githubusercontent.com/JackHONGhy/Tuning/main/Tuning}"
+
+# Session temp tracking (测速临时文件；测完/中断自动清)
+SESSION_TEMP_ROOT=""
+declare -a TRACKED_TEMPS=()
+CLEANUP_TEMPS_DONE=0
 
 # ---------- CLI / env overrides (highest priority) ----------
 OVERRIDE_ENABLE_LIMITS="${ENABLE_LIMITS:-}"
@@ -179,6 +188,100 @@ die(){ printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
 ts_now(){ date '+%H:%M:%S' 2>/dev/null || echo '--:--:--'; }
 
+# ---------- temp file lifecycle (clean after tests; keep config) ----------
+# KEEP: ENV_FILE, SERVICE/TIMER, INSTALL_PATH, SYSCTL, DETECT_CACHE, PROGRESS, RETUNE_LOG (rotated)
+# CLEAN: /tmp/bbr-cake.* session dirs, mktemp downloads, bench workdir, stale orphans, oversized logs
+
+register_temp(){
+  local p="$1"
+  [[ -n "${p}" ]] || return 0
+  TRACKED_TEMPS+=("${p}")
+}
+
+ensure_session_temp_root(){
+  if [[ -n "${SESSION_TEMP_ROOT}" && -d "${SESSION_TEMP_ROOT}" ]]; then
+    return 0
+  fi
+  SESSION_TEMP_ROOT="$(mktemp -d /tmp/bbr-cake.XXXXXX 2>/dev/null || mktemp -d)"
+  register_temp "${SESSION_TEMP_ROOT}"
+  CLEANUP_TEMPS_DONE=0
+}
+
+# Create file under session root (auto-tracked)
+make_temp_file(){
+  ensure_session_temp_root
+  local f
+  f="$(mktemp "${SESSION_TEMP_ROOT}/f.XXXXXX")"
+  register_temp "${f}"
+  printf '%s' "${f}"
+}
+
+make_temp_dir(){
+  ensure_session_temp_root
+  local d
+  d="$(mktemp -d "${SESSION_TEMP_ROOT}/d.XXXXXX")"
+  register_temp "${d}"
+  printf '%s' "${d}"
+}
+
+# Remove all session temps + stale bbr-cake.* under /tmp older than 2h
+cleanup_temps(){
+  local quiet="${1:-}"  # quiet|verbose
+  local p
+  for p in "${TRACKED_TEMPS[@]:-}"; do
+    [[ -n "${p}" ]] || continue
+    rm -rf "${p}" 2>/dev/null || true
+  done
+  TRACKED_TEMPS=()
+  if [[ -n "${SESSION_TEMP_ROOT}" ]]; then
+    rm -rf "${SESSION_TEMP_ROOT}" 2>/dev/null || true
+    SESSION_TEMP_ROOT=""
+  fi
+  # Orphans from killed runs (only our prefix)
+  if have_bin find; then
+    find /tmp -maxdepth 1 -type d -name 'bbr-cake.*' -mmin +120 -exec rm -rf {} + 2>/dev/null || true
+    find /tmp -maxdepth 1 -type f -name 'bbr-cake.*' -mmin +120 -exec rm -f {} + 2>/dev/null || true
+  else
+    # shell fallback: ignore errors
+    rm -rf /tmp/bbr-cake.* 2>/dev/null || true
+  fi
+  CLEANUP_TEMPS_DONE=1
+  [[ "${quiet}" == "quiet" ]] || log "已清理测速临时文件 (/tmp/bbr-cake.* 会话目录)"
+}
+
+# Truncate retune log if too large (keep last ~1500 lines)
+rotate_retune_log(){
+  [[ -f "${RETUNE_LOG_FILE}" ]] || return 0
+  local sz
+  sz="$(wc -c <"${RETUNE_LOG_FILE}" 2>/dev/null | tr -d ' ' || echo 0)"
+  [[ "${sz}" =~ ^[0-9]+$ ]] || return 0
+  if [[ "${sz}" -gt "${RETUNE_LOG_MAX_BYTES}" ]]; then
+    local tmp
+    tmp="$(mktemp 2>/dev/null || echo /tmp/bbr-cake-logtrim.$$)"
+    tail -n 1500 "${RETUNE_LOG_FILE}" >"${tmp}" 2>/dev/null || true
+    mv -f "${tmp}" "${RETUNE_LOG_FILE}" 2>/dev/null || cat "${tmp}" >"${RETUNE_LOG_FILE}"
+    rm -f "${tmp}" 2>/dev/null || true
+    log "retune 日志已轮转 (原 ${sz} bytes → 保留尾部)"
+  fi
+}
+
+# Post-detect housekeeping: temps + log rotate (never touch CAKE/config)
+post_detect_housekeeping(){
+  cleanup_temps quiet
+  rotate_retune_log
+  log "测速后清理完成（已删临时文件；保留配置/限速/服务/缓存/进度）"
+}
+
+# Best-effort trap: Ctrl+C during detect still drops temps
+_on_signal_cleanup_temps(){
+  cleanup_temps quiet 2>/dev/null || true
+}
+# Only register once
+if [[ -z "${_BBR_CAKE_TRAP_SET:-}" ]]; then
+  _BBR_CAKE_TRAP_SET=1
+  trap '_on_signal_cleanup_temps' INT TERM
+fi
+
 # Big stage banner: phase current/total title
 phase(){
   local cur="$1" total="$2" title="$3"
@@ -282,9 +385,16 @@ BBR + CAKE 中转调优 v${VERSION} (Transit Production)
   $0 apply       用已有配置应用
   $0 install     安装 + 定时器
   $0 status      状态/进度/定时器/日志
-  $0 cleanup     清理 qdisc
-  $0 uninstall   卸载
+  $0 cleanup       清运行时 qdisc/IFB/MSS + 临时文件（保留配置/服务）
+  $0 cleanup-temps 仅清测速临时文件与日志轮转
+  $0 uninstall     完全卸载（含配置/定时器/日志）
   $0 help
+
+清理原则:
+  自动(测速后): /tmp/bbr-cake.* 会话目录、下载样本、bench 工作区
+  保留: 限速配置、systemd、sysctl、测速缓存、进度、retune 日志(超限轮转)
+  cleanup 命令: 额外去掉运行中的 CAKE 规则（可用 apply 恢复）
+  uninstall: 全部删除
 
 示例:
   sudo bash $0
@@ -1114,7 +1224,7 @@ detect_http(){
 
   local urls="${HTTP_TEST_URLS//,/ }"
   local url best=0 got=0 mbit bytes secs tmp
-  tmp="$(mktemp)"
+  tmp="$(make_temp_file)"
 
   for url in ${urls}; do
     [[ -n "${url}" ]] || continue
@@ -1157,7 +1267,7 @@ detect_http(){
       fi
     fi
   done
-  rm -f "${tmp}"
+  rm -f "${tmp}" 2>/dev/null || true
 
   if [[ "${got}" -eq 1 ]]; then
     record_detect "http" "" "${best}" "download peak across URLs"
@@ -1171,7 +1281,7 @@ detect_speedtest(){
   step "测速方法 speedtest：本机 CLI（实时输出）"
 
   local up="" down="" note="" out
-  out="$(mktemp)"
+  out="$(make_temp_file)"
 
   if have_bin speedtest; then
     log "  running: speedtest (live)..."
@@ -1209,7 +1319,7 @@ detect_speedtest(){
     note="speedtest-cli"
   fi
 
-  rm -f "${out}"
+  rm -f "${out}" 2>/dev/null || true
 
   if [[ -z "${down}" && -z "${up}" ]]; then
     record_detect "speedtest" "" "" "skipped: install speedtest or speedtest-cli"
@@ -1232,7 +1342,7 @@ detect_iperf3(){
 
   local dur="${IPERF3_DURATION:-8}"
   local out down="" up=""
-  out="$(mktemp)"
+  out="$(make_temp_file)"
 
   step "iperf3 下行 (-R) → ${IPERF3_SERVER}（${dur}s）"
   set +e
@@ -1269,7 +1379,7 @@ detect_iperf3(){
       up="$(awk -v v="${up:-0}" 'BEGIN{printf "%d", int(v+0.5)}')"
     fi
   fi
-  rm -f "${out}"
+  rm -f "${out}" 2>/dev/null || true
 
   if [[ -z "${up}" && -z "${down}" ]]; then
     record_detect "iperf3" "" "" "failed against ${IPERF3_SERVER}"
@@ -1308,7 +1418,7 @@ detect_bench(){
   fi
 
   local work script out
-  work="$(mktemp -d)"
+  work="$(make_temp_dir)"
   script="${work}/bench.sh"
   out="${work}/out.txt"
 
@@ -1317,13 +1427,13 @@ detect_bench(){
   if have_bin curl; then
     if [[ "${LIVE_OUTPUT}" == "1" ]]; then
       curl -fL --max-time 60 --progress-bar "${BENCH_URL}" -o "${script}" || {
-        rm -rf "${work}"
+        rm -rf "${work}" 2>/dev/null || true
         record_detect "bench" "" "" "download failed"
         return 0
       }
     else
       curl -fsSL --max-time 60 "${BENCH_URL}" -o "${script}" || {
-        rm -rf "${work}"
+        rm -rf "${work}" 2>/dev/null || true
         record_detect "bench" "" "" "download failed"
         return 0
       }
@@ -1331,13 +1441,13 @@ detect_bench(){
   else
     if [[ "${LIVE_OUTPUT}" == "1" ]]; then
       wget -O "${script}" --timeout=60 --progress=bar:force "${BENCH_URL}" || {
-        rm -rf "${work}"
+        rm -rf "${work}" 2>/dev/null || true
         record_detect "bench" "" "" "download failed"
         return 0
       }
     else
       wget -q -O "${script}" --timeout=60 "${BENCH_URL}" || {
-        rm -rf "${work}"
+        rm -rf "${work}" 2>/dev/null || true
         record_detect "bench" "" "" "download failed"
         return 0
       }
@@ -1345,7 +1455,7 @@ detect_bench(){
   fi
 
   if [[ ! -s "${script}" ]]; then
-    rm -rf "${work}"
+    rm -rf "${work}" 2>/dev/null || true
     record_detect "bench" "" "" "empty script"
     return 0
   fi
@@ -1376,15 +1486,20 @@ detect_bench(){
   down="$(rate_to_mbit "${down}")"
   up="$(rate_to_mbit "${up}")"
 
-  # Keep a short log snippet for user
+  # Parse fail: keep short snippet in cache (not /tmp for 60s), then delete workdir
   if [[ -z "${up}" && -z "${down}" ]]; then
-    warn "bench finished but could not parse bandwidth; see ${work}/out.txt (kept 60s)"
-    ( sleep 60; rm -rf "${work}" ) &>/dev/null &
-    record_detect "bench" "" "" "parse failed (raw log retained briefly)"
+    mkdir -p "${CACHE_DIR}" 2>/dev/null || true
+    {
+      echo "# bench parse failed $(date -Is 2>/dev/null || date)"
+      tail -n 80 "${out}" 2>/dev/null || true
+    } >"${BENCH_FAIL_SNIPPET}" 2>/dev/null || true
+    warn "bench 无法解析带宽；摘要已写入 ${BENCH_FAIL_SNIPPET}，临时目录立即删除"
+    rm -rf "${work}" 2>/dev/null || true
+    record_detect "bench" "" "" "parse failed (snippet in cache)"
     return 0
   fi
 
-  rm -rf "${work}"
+  rm -rf "${work}" 2>/dev/null || true
   record_detect "bench" "${up}" "${down}" "remote ${BENCH_URL}"
 }
 
@@ -1759,6 +1874,7 @@ run_detect_pipeline(){
 
   if [[ -z "${PEAK_UP_MBIT:-}" && -z "${PEAK_DOWN_MBIT:-}" ]]; then
     warn "All detect methods failed or were skipped."
+    post_detect_housekeeping
     if [[ "${retain_on_fail}" == "1" ]]; then
       warn "保留已有限速配置，不覆盖（retune 失败保护）"
       return 1
@@ -1788,6 +1904,7 @@ run_detect_pipeline(){
   save_detect_cache
   accept_suggest_rates
   ok "带宽已自动填入: UP=${BANDWIDTH_UP_DEFAULT:-none} DOWN=${BANDWIDTH_DOWN_DEFAULT:-none}"
+  post_detect_housekeeping
   return 0
 }
 
@@ -1909,6 +2026,10 @@ auto_cmd(){
   fi
   ok "阶段 5/5 完成"
 
+  # Final temp/log housekeeping (idempotent if detect already cleaned)
+  cleanup_temps quiet 2>/dev/null || true
+  rotate_retune_log
+
   progress_done 5 "一键调优完成"
   echo
   echo "══════════════════════════════════════════════"
@@ -1918,6 +2039,7 @@ auto_cmd(){
   echo "看进度:   cat ${PROGRESS_FILE}"
   echo "手动重测: $0 retune"
   echo "卸载:     $0 uninstall"
+  echo "仅清运行时规则: $0 cleanup   (保留配置/服务/限速参数文件)"
 }
 
 # Nightly / manual re-detect and re-apply (keeps previous rates if detect fails)
@@ -1965,9 +2087,14 @@ retune_cmd(){
 
     progress_set 4 4 "每日重测-完成"
     show_qdisc_status
+    cleanup_temps quiet 2>/dev/null || true
+    rotate_retune_log
     ok "retune done UP=${BANDWIDTH_UP_DEFAULT:-none} DOWN=${BANDWIDTH_DOWN_DEFAULT:-none} rtt=${CAKE_RTT} ingress=${ENABLE_INGRESS_SHAPING}"
     echo "########## retune end $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || date) ##########"
   } 2>&1 | tee -a "${RETUNE_LOG_FILE}"
+  # outer rotate after tee flush
+  rotate_retune_log 2>/dev/null || true
+  cleanup_temps quiet 2>/dev/null || true
 }
 
 detect_cmd(){
@@ -1999,6 +2126,7 @@ detect_cmd(){
 
   if [[ -z "${PEAK_UP_MBIT:-}" && -z "${PEAK_DOWN_MBIT:-}" ]]; then
     warn "All methods failed or were skipped. Install speedtest-cli / set IPERF3_SERVER / fix HTTP URLs."
+    post_detect_housekeeping
     exit 2
   fi
 
@@ -2026,6 +2154,8 @@ DETECT_METHODS="${DETECT_METHODS}"
 EOF
     fi
   fi
+
+  post_detect_housekeeping
 
   echo
   ok "Detect done. 一键应用+安装请执行: $0 auto"
@@ -2230,8 +2360,36 @@ cleanup_runtime(){
     fi
   done
 
+  # Orphan IFB from previous interface renames (our naming prefix only)
+  if have_bin ip; then
+    local line name
+    while read -r line; do
+      name="$(printf '%s' "${line}" | awk -F': ' '{print $2}' | awk -F'@' '{print $1}')"
+      [[ "${name}" == ifb-* ]] || continue
+      log "Removing orphan IFB ${name}"
+      ip link delete "${name}" 2>/dev/null || true
+    done < <(ip -o link show 2>/dev/null | grep -E 'ifb-' || true)
+  fi
+
   cleanup_mss
   ok "Cleaned runtime qdisc/IFB/MSS state."
+}
+
+# cleanup = 运行时网络规则 + 临时文件；不碰安装配置/服务/限速参数
+cleanup_cmd(){
+  require_root
+  echo "====== cleanup (保留配置与 systemd) ======"
+  echo "将清理: tc/qdisc, IFB, MSS clamp, /tmp/bbr-cake.* 临时文件"
+  echo "不清理: ${ENV_FILE}, 服务/定时器, ${SYSCTL_FILE}, 测速缓存, 进度, 安装脚本"
+  cleanup_runtime || true
+  cleanup_temps
+  rotate_retune_log
+  # stale bench fail snippet older than 7 days
+  if [[ -f "${BENCH_FAIL_SNIPPET}" ]] && have_bin find; then
+    find "${CACHE_DIR}" -maxdepth 1 -name 'bench-last-fail.txt' -mtime +7 -delete 2>/dev/null || true
+  fi
+  ok "cleanup 完成。若需恢复整形: $0 apply  或  $0 retune"
+  echo "完全卸载请用: $0 uninstall"
 }
 
 uninstall_cmd(){
@@ -2247,17 +2405,23 @@ uninstall_cmd(){
     cleanup_runtime || true
   fi
 
+  cleanup_temps quiet 2>/dev/null || true
+  cleanup_runtime 2>/dev/null || true
+
   rm -f "${SERVICE_FILE}" "${RETUNE_SERVICE_FILE}" "${RETUNE_TIMER_FILE}"
   rm -f "${ENV_FILE}" "${SYSCTL_FILE}" "${INSTALL_PATH}"
-  rm -f "${DETECT_CACHE_FILE}" "${PROGRESS_FILE}"
-  rmdir "$(dirname "${DETECT_CACHE_FILE}")" 2>/dev/null || true
+  rm -f "${DETECT_CACHE_FILE}" "${PROGRESS_FILE}" "${BENCH_FAIL_SNIPPET}"
+  rm -rf "${RETUNE_LOG_DIR}" 2>/dev/null || true
+  rm -rf "${CACHE_DIR}" 2>/dev/null || true
+  # any leftover session dirs
+  rm -rf /tmp/bbr-cake.* 2>/dev/null || true
 
   if have_bin systemctl; then
     systemctl daemon-reload
   fi
 
   sysctl --system >/dev/null 2>&1 || true
-  ok "Uninstalled BBR + CAKE tuning files (incl. daily retune timer)."
+  ok "Uninstalled completely (rules + config + timer + logs + temps)."
 }
 
 status_cmd(){
@@ -2370,9 +2534,14 @@ main(){
     status)
       status_cmd
       ;;
-    cleanup)
+    cleanup|clean)
+      cleanup_cmd
+      ;;
+    cleanup-temps|clean-temps)
       require_root
-      cleanup_runtime
+      cleanup_temps
+      rotate_retune_log
+      ok "仅清理临时文件与日志轮转（未动 qdisc）"
       ;;
     uninstall)
       uninstall_cmd
