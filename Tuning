@@ -16,7 +16,7 @@ set -euo pipefail
 # NOTE: do NOT use set -E + ERR trap on [[ ]] && chains — bash fires ERR when
 # [[ condition ]] is false (e.g. empty detail in progress_set), aborting install.
 
-VERSION="3.3.3"
+VERSION="3.4.0"
 INSTALL_PATH="/usr/local/sbin/bbr-cake-transit-exit"
 SERVICE_NAME="bbr-cake-transit-exit.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
@@ -119,14 +119,17 @@ BANDWIDTH_SOURCE="${OVERRIDE_BANDWIDTH_SOURCE:-${BANDWIDTH_SOURCE:-none}}"
 BANDWIDTH_SAFETY_FACTOR="${OVERRIDE_BANDWIDTH_SAFETY_FACTOR:-${BANDWIDTH_SAFETY_FACTOR:-0.85}}"
 AUTO_DETECT_BW="${OVERRIDE_AUTO_DETECT_BW:-${AUTO_DETECT_BW:-0}}"
 AUTO_CONFIRM_PEAK="${OVERRIDE_AUTO_CONFIRM_PEAK:-${AUTO_CONFIRM_PEAK:-0}}"
-# 默认不含 bench（第三方远程脚本风险）；样本不足时由 AUTO_BENCH_FALLBACK 补测
-DETECT_METHODS="${OVERRIDE_DETECT_METHODS:-${DETECT_METHODS:-http,speedtest,iperf3}}"
+# 默认: http + speedtest(+自动装CLI) + bench；已移除默认 iperf3（需自备对端才有意义）
+DETECT_METHODS="${OVERRIDE_DETECT_METHODS:-${DETECT_METHODS:-http,speedtest,bench}}"
 IPERF3_SERVER="${OVERRIDE_IPERF3_SERVER:-${IPERF3_SERVER:-}}"
 IPERF3_DURATION="${OVERRIDE_IPERF3_DURATION:-${IPERF3_DURATION:-8}}"
-ALLOW_REMOTE_BENCH="${OVERRIDE_ALLOW_REMOTE_BENCH:-${ALLOW_REMOTE_BENCH:-0}}"
+# bench 在默认方法列表中时允许远程脚本（仍先下载到临时文件再执行，不用裸管道）
+ALLOW_REMOTE_BENCH="${OVERRIDE_ALLOW_REMOTE_BENCH:-${ALLOW_REMOTE_BENCH:-1}}"
 BENCH_URL="${OVERRIDE_BENCH_URL:-${BENCH_URL:-https://bench.sh}}"
-# 主测速无可用样本时，是否自动尝试一次 bench（仅 fallback）
+# 主测速仍无样本时是否再强行补一次 bench
 AUTO_BENCH_FALLBACK="${AUTO_BENCH_FALLBACK:-1}"
+# 测速前自动 apt/pip 安装 speedtest-cli（Debian/Ubuntu）
+AUTO_INSTALL_SPEEDTEST="${AUTO_INSTALL_SPEEDTEST:-1}"
 # 已有足够样本时提前结束后续轮次（每向至少 N 个有效样本）
 EARLY_STOP_SAMPLES="${EARLY_STOP_SAMPLES:-2}"
 # Comma/space separated large-file URLs for download timing (下行)
@@ -143,7 +146,6 @@ LIVE_OUTPUT="${LIVE_OUTPUT:-1}"
 MAX_RATE="${OVERRIDE_MAX_RATE:-${MAX_RATE:-}}"
 MAX_UP_RATE="${OVERRIDE_MAX_UP_RATE:-${MAX_UP_RATE:-${MAX_RATE:-}}}"
 MAX_DOWN_RATE="${OVERRIDE_MAX_DOWN_RATE:-${MAX_DOWN_RATE:-${MAX_RATE:-}}}"
-# Multi-round detect: 2 轮足够中位；bench 不在默认列表
 DETECT_ROUNDS="${OVERRIDE_DETECT_ROUNDS:-${DETECT_ROUNDS:-2}}"
 # median | max | min  — production transit prefers median
 AGGREGATE_MODE="${OVERRIDE_AGGREGATE_MODE:-${AGGREGATE_MODE:-median}}"
@@ -1379,9 +1381,51 @@ detect_http(){
   fi
 }
 
+# Auto-install speedtest / speedtest-cli on Debian/Ubuntu (and pip fallback)
+ensure_speedtest_tools(){
+  [[ "${AUTO_INSTALL_SPEEDTEST}" == "1" ]] || return 0
+  if have_bin speedtest || have_bin speedtest-cli; then
+    log "speedtest 工具已存在: $(command -v speedtest 2>/dev/null || true) $(command -v speedtest-cli 2>/dev/null || true)"
+    return 0
+  fi
+
+  step "自动安装 speedtest 工具（用于上下行测速）"
+  export DEBIAN_FRONTEND=noninteractive
+
+  if have_bin apt-get; then
+    log "  apt-get update (quiet)..."
+    apt-get update -qq </dev/null 2>/dev/null || true
+    log "  尝试: apt-get install -y speedtest-cli"
+    apt-get install -y -qq speedtest-cli </dev/null 2>/dev/null || true
+    if ! have_bin speedtest-cli && ! have_bin speedtest; then
+      log "  尝试: apt-get install -y speedtest"
+      apt-get install -y -qq speedtest </dev/null 2>/dev/null || true
+    fi
+  fi
+
+  if ! have_bin speedtest && ! have_bin speedtest-cli && have_bin pip3; then
+    log "  尝试: pip3 install speedtest-cli"
+    pip3 install -q speedtest-cli </dev/null 2>/dev/null || \
+      pip3 install -q --break-system-packages speedtest-cli </dev/null 2>/dev/null || true
+  fi
+
+  if ! have_bin speedtest && ! have_bin speedtest-cli && have_bin pip; then
+    log "  尝试: pip install speedtest-cli"
+    pip install -q speedtest-cli </dev/null 2>/dev/null || \
+      pip install -q --break-system-packages speedtest-cli </dev/null 2>/dev/null || true
+  fi
+
+  if have_bin speedtest || have_bin speedtest-cli; then
+    ok "speedtest 工具已就绪: $(command -v speedtest 2>/dev/null || command -v speedtest-cli)"
+  else
+    warn "无法自动安装 speedtest/speedtest-cli；将跳过 speedtest（可手动: apt-get install -y speedtest-cli）"
+  fi
+}
+
 # speedtest-cli or official ookla speedtest
 detect_speedtest(){
   step "测速方法 speedtest：本机 CLI（实时输出）"
+  ensure_speedtest_tools
 
   local up="" down="" note="" out
   out="$(make_temp_file)"
@@ -1425,14 +1469,15 @@ detect_speedtest(){
   rm -f "${out}" 2>/dev/null || true
 
   if [[ -z "${down}" && -z "${up}" ]]; then
-    record_detect "speedtest" "" "" "skipped: install speedtest or speedtest-cli"
+    record_detect "speedtest" "" "" "skipped: no speedtest CLI after auto-install attempt"
     return 0
   fi
   record_detect "speedtest" "${up}" "${down}" "${note:-speedtest}"
 }
 
+# Optional: kept for DETECT_METHODS=...,iperf3 manual use only (not in default list)
 detect_iperf3(){
-  step "测速方法 iperf3：点对点（实时输出）"
+  step "测速方法 iperf3：点对点（默认已移除；需 IPERF3_SERVER）"
 
   if ! have_bin iperf3; then
     record_detect "iperf3" "" "" "skipped: iperf3 not installed"
@@ -1564,6 +1609,7 @@ detect_bench(){
   fi
 
   chmod 0700 "${script}"
+  log "  说明: 等价于 bench.sh 测速，但不用「wget|bash」裸管道（先下载再执行，可审计）"
   log "  开始执行 bench（输出会实时显示在下方，请勿中断）..."
   log "  日志同时写入: ${out}"
   echo "---------- bench live output begin ----------"
@@ -1652,21 +1698,33 @@ run_all_detect_methods(){
   for m in ${methods}; do
     m="$(printf '%s' "${m}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')"
     [[ -n "${m}" ]] || continue
+    # strip default iperf3 if user didn't set server (avoid noise)
+    if [[ "${m}" == "iperf3" || "${m}" == "iperf" ]]; then
+      if [[ -z "${IPERF3_SERVER:-}" ]]; then
+        log "忽略方法 iperf3（默认已移除；需要时设 IPERF3_SERVER=对端 并 DETECT_METHODS=...,iperf3）"
+        continue
+      fi
+    fi
     list+=("${m}")
   done
 
-  # Prefer iperf3 first when server configured (most relevant for transit)
-  if [[ -n "${IPERF3_SERVER:-}" ]]; then
-    local reordered=() rest=()
-    for m in "${list[@]}"; do
-      if [[ "${m}" == "iperf3" || "${m}" == "iperf" ]]; then
-        reordered+=("${m}")
-      else
-        rest+=("${m}")
+  # 测速前：自动安装 speedtest CLI（若计划跑 speedtest）
+  for m in "${list[@]}"; do
+    if [[ "${m}" == "speedtest" || "${m}" == "st" ]]; then
+      ensure_speedtest_tools
+      break
+    fi
+  done
+
+  # 列表含 bench 时确保允许远程（仍走下载到文件，非裸管道）
+  for m in "${list[@]}"; do
+    if [[ "${m}" == "bench" || "${m}" == "benchsh" ]]; then
+      if [[ -z "${OVERRIDE_ALLOW_REMOTE_BENCH:-}" ]]; then
+        ALLOW_REMOTE_BENCH=1
       fi
-    done
-    list=("${reordered[@]}" "${rest[@]}")
-  fi
+      break
+    fi
+  done
 
   local rounds="${DETECT_ROUNDS:-1}"
   [[ "${rounds}" -ge 1 ]] || rounds=1
@@ -1686,16 +1744,16 @@ run_all_detect_methods(){
 
   local idx=0
   log "测速计划: methods=${list[*]}  rounds=${rounds}  early_stop≥${need}样本/向  LIVE=${LIVE_OUTPUT}"
-  log "聚合=${AGGREGATE_MODE}  安全系数=${BANDWIDTH_SAFETY_FACTOR}  bench默认不在列表(fallback=${AUTO_BENCH_FALLBACK})"
+  log "聚合=${AGGREGATE_MODE}  安全系数=${BANDWIDTH_SAFETY_FACTOR}  AUTO_INSTALL_SPEEDTEST=${AUTO_INSTALL_SPEEDTEST}"
 
   for ((r=1; r<=rounds; r++)); do
     step "测速轮次 ${r}/${rounds}"
     for m in "${list[@]}"; do
       if [[ "${m}" == "bench" || "${m}" == "benchsh" ]] && [[ "${r}" -gt 1 ]]; then
-        log "跳过 bench 第 ${r} 轮"
+        log "跳过 bench 第 ${r} 轮（只跑第1轮，耗时长）"
         continue
       fi
-      # early stop: enough samples already
+      # early stop: enough samples already (both directions)
       local sc up_n down_n
       sc="$(count_detect_samples)"
       up_n="${sc%% *}"
@@ -1703,12 +1761,6 @@ run_all_detect_methods(){
       if [[ "${up_n}" -ge "${need}" && "${down_n}" -ge "${need}" ]]; then
         ok "已有足够样本 up=${up_n} down=${down_n} (≥${need}) → 提前结束后续测速"
         return 0
-      fi
-      # skip iperf3 entirely if no server
-      if [[ "${m}" == "iperf3" || "${m}" == "iperf" ]] && [[ -z "${IPERF3_SERVER:-}" ]]; then
-        log "跳过 iperf3（未设置 IPERF3_SERVER）"
-        record_detect "iperf3" "" "" "skipped: set IPERF3_SERVER=host"
-        continue
       fi
       idx=$((idx + 1))
       progress_set "${idx}" "${total_steps}" "测速 ${m} (轮${r}/${rounds})" "method=${m} round=${r}"
@@ -1727,13 +1779,16 @@ run_all_detect_methods(){
     done
   done
 
-  # Fallback bench once if no usable samples
-  local sc2 u2 d2
+  # Fallback bench once if no usable samples and bench wasn't already run
+  local sc2 u2 d2 had_bench=0
   sc2="$(count_detect_samples)"
   u2="${sc2%% *}"
   d2="${sc2##* }"
-  if [[ "${u2}" -eq 0 && "${d2}" -eq 0 && "${AUTO_BENCH_FALLBACK}" == "1" ]]; then
-    warn "主测速无可用样本 → fallback 运行一次 bench（第三方脚本）"
+  for m in "${list[@]}"; do
+    [[ "${m}" == "bench" || "${m}" == "benchsh" ]] && had_bench=1
+  done
+  if [[ "${u2}" -eq 0 && "${d2}" -eq 0 && "${AUTO_BENCH_FALLBACK}" == "1" && "${had_bench}" -eq 0 ]]; then
+    warn "主测速无可用样本 → fallback 运行一次 bench（下载 bench.sh 后执行，非裸管道）"
     local old_allow="${ALLOW_REMOTE_BENCH}"
     ALLOW_REMOTE_BENCH=1
     progress_set "F" "F" "fallback bench" "AUTO_BENCH_FALLBACK"
@@ -2396,6 +2451,7 @@ DETECTED_COUNTRY="${DETECTED_COUNTRY}"
 REGION_PROFILE="${REGION_PROFILE}"
 AUTO_BENCH_FALLBACK="${AUTO_BENCH_FALLBACK}"
 EARLY_STOP_SAMPLES="${EARLY_STOP_SAMPLES}"
+AUTO_INSTALL_SPEEDTEST="${AUTO_INSTALL_SPEEDTEST}"
 EOF
 }
 
