@@ -16,7 +16,7 @@ set -euo pipefail
 # NOTE: do NOT use set -E + ERR trap on [[ ]] && chains — bash fires ERR when
 # [[ condition ]] is false (e.g. empty detail in progress_set), aborting install.
 
-VERSION="3.4.1"
+VERSION="3.4.2"
 INSTALL_PATH="/usr/local/sbin/bbr-cake-transit-exit"
 SERVICE_NAME="bbr-cake-transit-exit.service"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}"
@@ -121,6 +121,12 @@ AUTO_DETECT_BW="${OVERRIDE_AUTO_DETECT_BW:-${AUTO_DETECT_BW:-0}}"
 AUTO_CONFIRM_PEAK="${OVERRIDE_AUTO_CONFIRM_PEAK:-${AUTO_CONFIRM_PEAK:-0}}"
 # 默认: http + speedtest(+自动装CLI) + bench；已移除默认 iperf3（需自备对端才有意义）
 DETECT_METHODS="${OVERRIDE_DETECT_METHODS:-${DETECT_METHODS:-http,speedtest,bench}}"
+# 迁移旧版配置：仍带 iperf3、无 bench 时改为新默认
+if [[ -z "${OVERRIDE_DETECT_METHODS:-}" ]]; then
+  if printf '%s' "${DETECT_METHODS}" | grep -q 'iperf3' && ! printf '%s' "${DETECT_METHODS}" | grep -q 'bench'; then
+    DETECT_METHODS="http,speedtest,bench"
+  fi
+fi
 IPERF3_SERVER="${OVERRIDE_IPERF3_SERVER:-${IPERF3_SERVER:-}}"
 IPERF3_DURATION="${OVERRIDE_IPERF3_DURATION:-${IPERF3_DURATION:-8}}"
 # bench 在默认方法列表中时允许远程脚本（仍先下载到临时文件再执行，不用裸管道）
@@ -1619,57 +1625,95 @@ ensure_speedtest_tools(){
   fi
 }
 
-# speedtest-cli or official ookla speedtest
+# Return: ookla | scli | unknown  (Debian 的 speedtest 往往是 speedtest-cli 的软链)
+speedtest_bin_flavor(){
+  local bin="$1" help=""
+  [[ -n "${bin}" && -x "${bin}" ]] || { printf 'unknown'; return 0; }
+  help="$("${bin}" --help 2>&1 || true)"
+  if printf '%s' "${help}" | grep -q -- '--accept-license'; then
+    printf 'ookla'
+  elif printf '%s' "${help}" | grep -qE -- '--simple|speedtest-cli'; then
+    printf 'scli'
+  elif printf '%s' "${help}" | grep -q -- '--secure'; then
+    printf 'scli'
+  else
+    printf 'unknown'
+  fi
+}
+
+# speedtest-cli (python) or official Ookla speedtest
 detect_speedtest(){
   step "测速方法 speedtest：本机 CLI（实时输出）"
   ensure_speedtest_tools
 
-  local up="" down="" note="" out
+  local up="" down="" note="" out ping_ms="" flavor="" bin=""
   out="$(make_temp_file)"
 
-  if have_bin speedtest; then
-    log "  running: speedtest (live)..."
-    set +e
-    # Prefer human-readable live progress when LIVE_OUTPUT=1
-    if [[ "${LIVE_OUTPUT}" == "1" ]]; then
-      run_live "${out}" speedtest --accept-license --accept-gdpr --progress=yes
-      down="$(grep -iE 'Download' "${out}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)"
-      up="$(grep -iE 'Upload' "${out}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)"
-      down="$(rate_to_mbit "${down}")"
-      up="$(rate_to_mbit "${up}")"
-      note="speedtest live"
-    fi
-    if [[ -z "${down}" && -z "${up}" ]]; then
-      : >"${out}"
-      run_live "${out}" speedtest --accept-license --accept-gdpr -f json
-      if have_bin python3; then
-        down="$(python3 -c 'import sys,json; d=json.load(open(sys.argv[1])); print(int(d["download"]["bandwidth"]*8/1e6+0.5))' "${out}" 2>/dev/null || true)"
-        up="$(python3 -c 'import sys,json; d=json.load(open(sys.argv[1])); print(int(d["upload"]["bandwidth"]*8/1e6+0.5))' "${out}" 2>/dev/null || true)"
-      fi
-      note="ookla speedtest JSON"
-    fi
-    set -e
+  # Prefer dedicated speedtest-cli name; avoid treating python CLI as Ookla
+  if have_bin speedtest-cli; then
+    bin="$(command -v speedtest-cli)"
+  elif have_bin speedtest; then
+    bin="$(command -v speedtest)"
   fi
 
-  if [[ -z "${down}" && -z "${up}" ]] && have_bin speedtest-cli; then
-    log "  running: speedtest-cli --simple (live)..."
-    set +e
-    run_live "${out}" speedtest-cli --simple
-    set -e
+  if [[ -z "${bin}" ]]; then
+    record_detect "speedtest" "" "" "skipped: no speedtest CLI after auto-install attempt"
+    return 0
+  fi
+
+  flavor="$(speedtest_bin_flavor "${bin}")"
+  log "  使用: ${bin} (类型=${flavor})"
+
+  set +e
+  if [[ "${flavor}" == "ookla" ]]; then
+    log "  running: Ookla speedtest..."
+    if [[ "${LIVE_OUTPUT}" == "1" ]]; then
+      run_live "${out}" "${bin}" --accept-license --accept-gdpr --progress=yes
+    else
+      run_live "${out}" "${bin}" --accept-license --accept-gdpr -f json
+    fi
+    down="$(grep -iE 'Download' "${out}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)"
+    up="$(grep -iE 'Upload' "${out}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)"
+    if [[ -z "${down}" && -z "${up}" ]] && have_bin python3; then
+      down="$(python3 -c 'import sys,json; d=json.load(open(sys.argv[1])); print(int(d["download"]["bandwidth"]*8/1e6+0.5))' "${out}" 2>/dev/null || true)"
+      up="$(python3 -c 'import sys,json; d=json.load(open(sys.argv[1])); print(int(d["upload"]["bandwidth"]*8/1e6+0.5))' "${out}" 2>/dev/null || true)"
+    fi
+    down="$(rate_to_mbit "${down}")"
+    up="$(rate_to_mbit "${up}")"
+    note="ookla-speedtest"
+  else
+    # python speedtest-cli (Debian/Ubuntu 默认包)
+    log "  running: speedtest-cli --simple --secure..."
+    run_live "${out}" "${bin}" --simple --secure
+    if ! grep -qiE 'Download|Upload' "${out}" 2>/dev/null; then
+      : >"${out}"
+      run_live "${out}" "${bin}" --simple
+    fi
     down="$(grep -i Download "${out}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)"
     up="$(grep -i Upload "${out}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)"
+    ping_ms="$(grep -i Ping "${out}" 2>/dev/null | grep -oE '[0-9]+(\.[0-9]+)?' | head -1 || true)"
     down="$(rate_to_mbit "${down}")"
     up="$(rate_to_mbit "${up}")"
     note="speedtest-cli"
+    # 丢弃异常：Ping 离谱（如 1800000ms）或结果接近 0
+    if [[ -n "${ping_ms}" ]]; then
+      local pinti
+      pinti="$(awk -v p="${ping_ms}" 'BEGIN{printf "%d", p+0}')"
+      if [[ "${pinti}" -gt 5000 ]]; then
+        warn "  speedtest 结果异常 (Ping≈${ping_ms}ms)，丢弃本轮样本"
+        up=""; down=""; note="speedtest-cli discarded (bad ping)"
+      fi
+    fi
   fi
+  set -e
 
   rm -f "${out}" 2>/dev/null || true
 
   if [[ -z "${down}" && -z "${up}" ]]; then
-    record_detect "speedtest" "" "" "skipped: no speedtest CLI after auto-install attempt"
+    record_detect "speedtest" "" "" "${note:-failed}"
     return 0
   fi
-  record_detect "speedtest" "${up}" "${down}" "${note:-speedtest}"
+  record_detect "speedtest" "${up}" "${down}" "${note}"
 }
 
 # Optional: kept for DETECT_METHODS=...,iperf3 manual use only (not in default list)
@@ -1994,12 +2038,40 @@ run_all_detect_methods(){
   fi
 }
 
+# Drop samples that are far below the max (e.g. one bad speedtest of 260 when max is 1093)
+filter_outlier_lows(){
+  local -a in=("$@")
+  local -a out=()
+  local max=0 v thr
+  for v in "${in[@]}"; do
+    [[ -n "${v}" && "${v}" =~ ^[0-9]+$ && "${v}" -gt 0 ]] || continue
+    max="$(max_int "${max}" "${v}")"
+  done
+  [[ "${max}" -gt 0 ]] || return 0
+  # keep if >= 55% of max
+  thr="$(awk -v m="${max}" 'BEGIN{printf "%d", int(m*0.55+0.5)}')"
+  for v in "${in[@]}"; do
+    [[ -n "${v}" && "${v}" =~ ^[0-9]+$ && "${v}" -gt 0 ]] || continue
+    if [[ "${v}" -ge "${thr}" ]]; then
+      out+=("${v}")
+    else
+      log "  丢弃离群低值样本 ${v} Mbit (< ${thr} = 55% of max ${max})"
+    fi
+  done
+  if [[ ${#out[@]} -eq 0 ]]; then
+    # if all dropped, keep max only
+    printf '%s\n' "${max}"
+  else
+    printf '%s\n' "${out[@]}"
+  fi
+}
+
 aggregate_peaks(){
   PEAK_UP_MBIT=""
   PEAK_DOWN_MBIT=""
   local i n="${#DETECT_METHOD_NAMES[@]}"
   local up down
-  local -a ups=() downs=()
+  local -a ups=() downs=() ups_f=() downs_f=()
   local max_up=0 max_down=0 min_up="" min_down=""
 
   for ((i=0; i<n; i++)); do
@@ -2007,14 +2079,36 @@ aggregate_peaks(){
     down="${DETECT_DOWN_MBITS[i]:-}"
     if [[ -n "${up}" && "${up}" =~ ^[0-9]+$ && "${up}" -gt 0 ]]; then
       ups+=("${up}")
-      max_up="$(max_int "${max_up}" "${up}")"
-      if [[ -z "${min_up}" ]]; then min_up="${up}"; else min_up="$(min_int "${min_up}" "${up}")"; fi
     fi
     if [[ -n "${down}" && "${down}" =~ ^[0-9]+$ && "${down}" -gt 0 ]]; then
       downs+=("${down}")
-      max_down="$(max_int "${max_down}" "${down}")"
-      if [[ -z "${min_down}" ]]; then min_down="${down}"; else min_down="$(min_int "${min_down}" "${down}")"; fi
     fi
+  done
+
+  # outlier filter
+  if [[ ${#ups[@]} -gt 0 ]]; then
+    while IFS= read -r up; do
+      [[ -n "${up}" ]] && ups_f+=("${up}")
+    done < <(filter_outlier_lows "${ups[@]}")
+    ups=("${ups_f[@]}")
+  fi
+  if [[ ${#downs[@]} -gt 0 ]]; then
+    while IFS= read -r down; do
+      [[ -n "${down}" ]] && downs_f+=("${down}")
+    done < <(filter_outlier_lows "${downs[@]}")
+    downs=("${downs_f[@]}")
+  fi
+
+  max_up=0; max_down=0; min_up=""; min_down=""
+  for up in "${ups[@]:-}"; do
+    [[ -n "${up}" ]] || continue
+    max_up="$(max_int "${max_up}" "${up}")"
+    if [[ -z "${min_up}" ]]; then min_up="${up}"; else min_up="$(min_int "${min_up}" "${up}")"; fi
+  done
+  for down in "${downs[@]:-}"; do
+    [[ -n "${down}" ]] || continue
+    max_down="$(max_int "${max_down}" "${down}")"
+    if [[ -z "${min_down}" ]]; then min_down="${down}"; else min_down="$(min_int "${min_down}" "${down}")"; fi
   done
 
   local mode="${AGGREGATE_MODE:-median}"
@@ -2033,7 +2127,7 @@ aggregate_peaks(){
       ;;
   esac
 
-  log "聚合[${mode}] 原始 up=${PEAK_UP_MBIT:-n/a} down=${PEAK_DOWN_MBIT:-n/a} (样本 up=${#ups[@]} down=${#downs[@]})"
+  log "聚合[${mode}] 过滤后 up=${PEAK_UP_MBIT:-n/a} down=${PEAK_DOWN_MBIT:-n/a} (样本 up=${#ups[@]} down=${#downs[@]} max_up=${max_up} max_down=${max_down})"
 
   # Cap measured peak before applying safety (防止 10G 虚高)
   if [[ -n "${PEAK_UP_MBIT}" ]]; then
